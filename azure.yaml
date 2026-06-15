@@ -1,0 +1,8 @@
+name: spotify-stats-dashboard
+metadata:
+  template: appservice-node
+services:
+  app:
+    project: .
+    host: appservice
+    language: js
