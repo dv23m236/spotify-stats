@@ -341,14 +341,20 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
       image:  t.album && t.album.images && t.album.images[0] ? t.album.images[0].url : 'https://via.placeholder.com/300'
     })).filter(t => t.title && t.artist);
 
-    const artistPool = allArtists.map(a => ({
-      name:       a.name,
-      popularity: a.popularity !== undefined ? a.popularity : (Math.floor(Math.random() * 30) + 50),
-      image:      a.images && a.images[0] ? a.images[0].url : 'https://via.placeholder.com/300'
-    })).filter(a => a.name);
+    // Pool für das Release-Jahr-Quiz: Albumcover, Songtitel & echtes Erscheinungsjahr
+    const yearPool = allTracks.map(t => {
+      const releaseDate = t.album && t.album.release_date ? t.album.release_date : null;
+      const releaseYear = releaseDate ? parseInt(releaseDate.substring(0, 4), 10) : NaN;
+      return {
+        title:  t.name,
+        artist: t.artists && t.artists[0] ? t.artists[0].name : 'Unbekannt',
+        image:  t.album && t.album.images && t.album.images[0] ? t.album.images[0].url : 'https://via.placeholder.com/300',
+        year:   releaseYear
+      };
+    }).filter(t => t.title && !isNaN(t.year));
 
-    const base64QuizPool   = Buffer.from(encodeURIComponent(JSON.stringify(quizPool))).toString('base64');
-    const base64ArtistPool = Buffer.from(encodeURIComponent(JSON.stringify(artistPool))).toString('base64');
+    const base64QuizPool = Buffer.from(encodeURIComponent(JSON.stringify(quizPool))).toString('base64');
+    const base64YearPool = Buffer.from(encodeURIComponent(JSON.stringify(yearPool))).toString('base64');
 
     res.send(`
       <!DOCTYPE html>
@@ -589,6 +595,77 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             color: rgba(255,255,255,0.3);
             font-style: italic;
             margin: 15px 0;
+          }
+
+          /* Release-Jahr-Quiz: Zeitstrahl-Slider */
+          .year-slider-wrapper {
+            margin: 30px auto 10px;
+            max-width: 480px;
+          }
+
+          .year-display {
+            font-size: 48px;
+            font-weight: 800;
+            color: #1DB954;
+            letter-spacing: 2px;
+            margin-bottom: 18px;
+          }
+
+          .year-slider {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 8px;
+            border-radius: 4px;
+            background: linear-gradient(90deg, rgba(29,185,84,0.12), rgba(29,185,84,0.5));
+            outline: none;
+            cursor: pointer;
+          }
+
+          .year-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 28px;
+            height: 28px;
+            border-radius: 6px;
+            background: #1DB954;
+            cursor: pointer;
+            border: 2px solid #ffffff;
+            box-shadow: 0 4px 14px rgba(29,185,84,0.5);
+            transition: transform 0.15s ease;
+          }
+
+          .year-slider::-webkit-slider-thumb:hover {
+            transform: scale(1.1);
+          }
+
+          .year-slider::-moz-range-thumb {
+            width: 28px;
+            height: 28px;
+            border-radius: 6px;
+            background: #1DB954;
+            cursor: pointer;
+            border: 2px solid #ffffff;
+            box-shadow: 0 4px 14px rgba(29,185,84,0.5);
+          }
+
+          .year-slider:disabled::-webkit-slider-thumb {
+            background: #777;
+            box-shadow: none;
+          }
+
+          .year-slider:disabled::-moz-range-thumb {
+            background: #777;
+            box-shadow: none;
+          }
+
+          .year-slider-labels {
+            display: flex;
+            justify-content: space-between;
+            color: #b3b3b3;
+            font-size: 13px;
+            margin-top: 10px;
+            font-weight: 600;
           }
             
           /* ==========================================
@@ -914,7 +991,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             <h2 class="section-title"><i class="fas fa-gamepad"></i> Musik-Minispiele</h2>
             <div style="display:flex; justify-content:center; gap:20px; margin-bottom:30px;">
               <button class="hl-btn" onclick="startSongQuiz()">Song-Erkennungs-Quiz</button>
-              <button class="hl-btn" onclick="startArtistQuiz()">Künstler-Popularität</button>
+              <button class="hl-btn" onclick="startYearQuiz()">Release-Jahr-Quiz</button>
             </div>
             <div id="game-arena">
               <p style="text-align:center; color:#b3b3b3;">Wähle oben ein Minispiel aus, um zu starten!</p>
@@ -928,7 +1005,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           let premiumWarningUntil = 0;
 
           const quizPool = JSON.parse(decodeURIComponent(atob("${base64QuizPool}")));
-          const artistPool = JSON.parse(decodeURIComponent(atob("${base64ArtistPool}")));
+          const yearPool = JSON.parse(decodeURIComponent(atob("${base64YearPool}")));
 
           function switchPage(pageId) {
             // 1. Alle Seiten ausblenden
@@ -1127,7 +1204,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           // Quiz Engine
           let quizScore = 0;
           let quizHighScore = localStorage.getItem('quizHighScore') ? parseInt(localStorage.getItem('quizHighScore')) : 0;
-          let artistHighScore = localStorage.getItem('artistHighScore') ? parseInt(localStorage.getItem('artistHighScore')) : 0;
+          let yearHighScore = localStorage.getItem('yearHighScore') ? parseInt(localStorage.getItem('yearHighScore')) : 0;
 
           function startSongQuiz() {
             if (typeof quizPool !== 'undefined' && quizPool.length < 4) {
@@ -1340,115 +1417,130 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             }
           }
 
-          // Artist Popularity
-          let artistScore = 0;
-          function startArtistQuiz() {
-            if (artistPool.length < 2) {
-              document.getElementById('game-arena').innerHTML = '<p style="text-align:center;color:#ff5252;">Nicht genug Künstler im Pool vorhanden.</p>';
+          // Release-Jahr-Quiz
+          let yearScore = 0;
+          let yearSliderMin = 1990;
+          let yearSliderMax = new Date().getFullYear();
+
+          function startYearQuiz() {
+            if (typeof yearPool === 'undefined' || yearPool.length < 1) {
+              document.getElementById('game-arena').innerHTML = '<p style="text-align:center;color:#ff5252;">Nicht genug Songs mit Erscheinungsjahr vorhanden.</p>';
               return;
             }
-            artistScore = 0;
-            nextArtistQuestion();
+
+            // Slider-Bereich anhand der echten Top-Tracks bestimmen (mit etwas Puffer)
+            const years = yearPool.map(t => t.year);
+            const currentYear = new Date().getFullYear();
+            yearSliderMin = Math.max(1950, Math.min.apply(null, years) - 5);
+            yearSliderMax = Math.min(currentYear, Math.max.apply(null, years) + 5);
+            if (yearSliderMax - yearSliderMin < 10) {
+              yearSliderMin = Math.max(1950, yearSliderMin - 5);
+              yearSliderMax = Math.min(currentYear, yearSliderMax + 5);
+            }
+
+            yearScore = 0;
+            nextYearQuestion();
           }
 
-          function nextArtistQuestion() {
-            const idx1 = Math.floor(Math.random() * artistPool.length);
-            let idx2 = Math.floor(Math.random() * artistPool.length);
-            while(idx1 === idx2) idx2 = Math.floor(Math.random() * artistPool.length);
-
-            const a1 = artistPool[idx1];
-            const a2 = artistPool[idx2];
+          function nextYearQuestion() {
+            const idx = Math.floor(Math.random() * yearPool.length);
+            const track = yearPool[idx];
+            const startValue = Math.round((yearSliderMin + yearSliderMax) / 2);
 
             document.getElementById('game-arena').innerHTML = \`
-              <div class="quiz-card" style="max-width: 800px;">
-                <div class="quiz-score">Score: \${artistScore} <span style="color:#b3b3b3; margin-left: 15px; font-size: 13px;">Highscore: \${artistHighScore}</span></div>
-                <h2 style="margin-bottom:30px;">Wer ist auf Spotify weltweit populärer?</h2>
-                <div class="higher-lower-grid">
-                  <div class="hl-choice">
-                    <img src="\${a1.image}" class="quiz-img" style="border-radius:50%;">
-                    <h3>\${a1.name}</h3>
-                    <p style="color:#1DB954; font-weight:700; font-size:20px;">Popularität: \${a1.popularity}</p>
-                  </div>
-                  <div class="hl-choice">
-                    <img src="\${a2.image}" class="quiz-img" style="border-radius:50%;">
-                    <h3>\${a2.name}</h3>
-                    <button class="hl-btn" onclick="checkArtistAnswer(\${a2.popularity}, 'RampUp', \${a1.popularity})">Mehr</button>
-                    <button class="hl-btn" style="background:#ff5252; color:white;" onclick="checkArtistAnswer(\${a2.popularity}, 'Low', \${a1.popularity})">Weniger</button>
+              <div class="quiz-card">
+                <div class="quiz-score">Score: \${yearScore} <span style="color:#b3b3b3; margin-left: 15px; font-size: 13px;">Highscore: \${yearHighScore}</span></div>
+                <h2>In welchem Jahr wurde dieser Song veröffentlicht?</h2>
+                <div class="quiz-img-wrapper">
+                  <img src="\${track.image}" class="quiz-img">
+                </div>
+                <h3 style="margin-bottom:2px;">\${track.title}</h3>
+                <p style="color:#b3b3b3; margin-top:0;">\${track.artist}</p>
+
+                <div class="year-slider-wrapper">
+                  <div class="year-display" id="year-display">\${startValue}</div>
+                  <input type="range" min="\${yearSliderMin}" max="\${yearSliderMax}" step="1" value="\${startValue}" class="year-slider" id="year-slider" oninput="document.getElementById('year-display').innerText = this.value">
+                  <div class="year-slider-labels">
+                    <span>\${yearSliderMin}</span>
+                    <span>\${yearSliderMax}</span>
                   </div>
                 </div>
+
+                <button class="hl-btn" id="year-confirm-btn" onclick="checkYearAnswer(\${track.year})">Bestätigen</button>
               </div>\`;
           }
 
-          function checkArtistAnswer(p2, choice, p1) {
-            let correct = false;
-            if (choice === 'RampUp' && p2 >= p1) correct = true;
-            if (choice === 'Low' && p2 <= p1) correct = true;
+          function checkYearAnswer(actualYear) {
+            const slider = document.getElementById('year-slider');
+            const guess = parseInt(slider.value, 10);
+            const diff = Math.abs(guess - actualYear);
+            const correct = diff <= 2; // 2 Jahre Toleranz
 
-            const choiceBlocks = document.querySelectorAll('.hl-choice');
-            if (choiceBlocks.length > 1) {
-              const p2Element = document.createElement('p');
-              p2Element.style.fontWeight = '700';
-              p2Element.style.fontSize = '20px';
-              p2Element.style.marginTop = '15px';
-              
-              if (correct) {
-                p2Element.style.color = '#1DB954';
-                p2Element.innerHTML = 'Popularität: ' + p2 + ' ✔';
-              } else {
-                p2Element.style.color = '#ff5252';
-                p2Element.innerHTML = 'Popularität: ' + p2 + ' ❌';
-              }
-              
-              const oldBtns = choiceBlocks[1].querySelectorAll('.hl-btn');
-              oldBtns.forEach(b => b.style.display = 'none');
-              choiceBlocks[1].appendChild(p2Element);
-            }
+            slider.disabled = true;
+            const confirmBtn = document.getElementById('year-confirm-btn');
+            if (confirmBtn) confirmBtn.style.display = 'none';
+
+            const resultP = document.createElement('p');
+            resultP.style.fontWeight = '700';
+            resultP.style.fontSize = '18px';
+            resultP.style.marginTop = '15px';
 
             if (correct) {
-              artistScore++;
+              resultP.style.color = '#1DB954';
+              resultP.innerHTML = (diff === 0)
+                ? 'Genau richtig! ' + actualYear + ' ✔'
+                : 'Nah dran! Tatsächlich: ' + actualYear + ' ✔';
+            } else {
+              resultP.style.color = '#ff5252';
+              resultP.innerHTML = 'Leider falsch. Tatsächlich: ' + actualYear + ' ❌';
+            }
 
-              // Score-Anzeige live aktualisieren
+            const card = document.querySelector('.quiz-card');
+            if (card) card.appendChild(resultP);
+
+            if (correct) {
+              yearScore++;
+
               const scoreDiv = document.querySelector('.quiz-score');
               if (scoreDiv) {
-                scoreDiv.innerHTML = 'Score: ' + artistScore + ' <span style="color:#b3b3b3; margin-left: 15px; font-size: 13px;">Highscore: ' + artistHighScore + '</span>';
+                scoreDiv.innerHTML = 'Score: ' + yearScore + ' <span style="color:#b3b3b3; margin-left: 15px; font-size: 13px;">Highscore: ' + yearHighScore + '</span>';
               }
 
-              setTimeout(nextArtistQuestion, 1500);
+              setTimeout(nextYearQuestion, 1800);
             } else {
-              // Highscore aktualisieren, falls überboten
-              if (artistScore > artistHighScore) {
-                artistHighScore = artistScore;
-                localStorage.setItem('artistHighScore', artistHighScore);
+              if (yearScore > yearHighScore) {
+                yearHighScore = yearScore;
+                localStorage.setItem('yearHighScore', yearHighScore);
               }
 
               setTimeout(() => {
                 const arena = document.getElementById('game-arena');
                 if (arena) {
                   arena.innerHTML = '';
-                  
+
                   const card = document.createElement('div');
                   card.className = 'quiz-card';
                   card.style.borderColor = '#ff5252';
-                  
+
                   const title = document.createElement('h2');
                   title.innerText = 'Vorbei! ❌';
-                  
+
                   const scoreP = document.createElement('p');
                   scoreP.style.fontSize = '18px';
                   scoreP.style.margin = '15px 0';
-                  scoreP.innerHTML = 'Deine Punktzahl: <strong style="color:#1DB954;">' + artistScore + '</strong><br><span style="font-size:14px; color:#b3b3b3;">Dein Highscore: ' + artistHighScore + '</span>';
-                  
+                  scoreP.innerHTML = 'Deine Punktzahl: <strong style="color:#1DB954;">' + yearScore + '</strong><br><span style="font-size:14px; color:#b3b3b3;">Dein Highscore: ' + yearHighScore + '</span>';
+
                   const btn = document.createElement('button');
                   btn.className = 'hl-btn';
                   btn.innerText = 'Nochmal spielen';
-                  btn.onclick = startArtistQuiz;
-                  
+                  btn.onclick = startYearQuiz;
+
                   card.appendChild(title);
                   card.appendChild(scoreP);
                   card.appendChild(btn);
                   arena.appendChild(card);
                 }
-              }, 1800);
+              }, 2200);
             }
           }
 
