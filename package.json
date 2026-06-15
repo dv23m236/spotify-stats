@@ -1,0 +1,16 @@
+{
+  "name": "spotify-stats-dashboard",
+  "version": "1.0.0",
+  "description": "Spotify Stats Dashboard on Azure App Service",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "@azure/cosmos": "^4.2.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.19.2",
+    "express-session": "^1.19.0",
+    "spotify-web-api-node": "^5.0.2"
+  }
+}
