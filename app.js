@@ -18,6 +18,8 @@ if (missingEnvVars.length > 0) {
   process.exit(1);
 }
 
+app.set('trust proxy', 1);
+
 // 1. Express-Session konfigurieren
 app.use(session({
   secret: process.env.SESSION_SECRET,
