@@ -8,9 +8,8 @@ param spotifyClientSecret string
 @secure()
 param sessionSecret string
 
-// Generiert einen garantiert kleingeschriebenen, eindeutigen Namen ohne Punkte
-var uniqueSuffix = uniqueString(resourceGroup().id, environmentName)
-var cleanCosmosName = toLower(replace('cosmos-${environmentName}-${uniqueSuffix}', '.', ''))
+// FIX: Entfernt alle Punkte aus dem Namen, damit Azure Cosmos DB nicht abstürzt
+var cleanCosmosName = replace('cosmos-${environmentName}', '.', '')
 
 // 1. Cosmos DB
 resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2023-04-15' = {
