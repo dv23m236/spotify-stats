@@ -3,7 +3,9 @@ require('dotenv').config(); // Lädt Variablen aus der .env-Datei (lokal) bzw. a
 const Express = require('express');
 const SpotifyWebApi = require('spotify-web-api-node');
 const { CosmosClient } = require('@azure/cosmos');
-const session = require('express-session'); // NEU: Session-Paket laden
+const session = require('express-session');
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 const app = Express();
 const port = process.env.PORT || 8000;
@@ -874,6 +876,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             <li id="nav-page-tracks" data-page="page-tracks" class="nav-item" onclick="switchPage('page-tracks')"><i class="fas fa-music"></i> Top Tracks</li>
             <li id="nav-page-artists" data-page="page-artists" class="nav-item" onclick="switchPage('page-artists')"><i class="fas fa-microphone"></i> Top Künstler</li>
             <li id="nav-page-games" data-page="page-games" class="nav-item" onclick="switchPage('page-games')"><i class="fas fa-gamepad"></i> Minispiele</li>
+            <li id="nav-page-import" data-page="page-import" class="nav-item" onclick="switchPage('page-import')"><i class="fas fa-file-import"></i> Import</li>
           </ul>
         </div>
         
@@ -953,6 +956,19 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
               <p style="text-align:center; color:#b3b3b3;">Wähle oben ein Minispiel aus, um zu starten!</p>
             </div>
           </div>
+
+          <div id="page-import" class="app-page">
+            <h2 class="section-title"><i class="fas fa-file-import"></i> Spotify-Daten importieren</h2>
+            <div style="max-width:560px; margin:0 auto;">
+              <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); border-radius:16px; padding:32px;">
+                <p style="color:#b3b3b3; font-size:14px; line-height:1.6; margin-top:0;">Lade deine Streaming-Historie als JSON-Datei hoch (z.&nbsp;B. <code style='color:#1DB954;'>StreamingHistory_music_*.json</code> aus dem Spotify-Datenexport).</p>
+                <label style="display:block; margin-bottom:12px; font-size:13px; font-weight:600; color:#b3b3b3;">JSON-Datei auswählen</label>
+                <input type="file" id="spotify-import-file" accept=".json" style="display:block; width:100%; padding:10px 14px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); border-radius:10px; color:white; font-family:'Poppins',sans-serif; font-size:13px; cursor:pointer; margin-bottom:20px;">
+                <button onclick="handleSpotifyImport()" class="hl-btn" style="width:100%; justify-content:center;"><i class="fas fa-upload" style="margin-right:8px;"></i>Importieren</button>
+                <div id="import-status" style="margin-top:18px; font-size:13px; line-height:1.6;"></div>
+              </div>
+            </div>
+          </div>
         </div>
 
         <nav class="mobile-bottom-nav">
@@ -968,6 +984,9 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           <button class="mobile-nav-item" data-page="page-games" onclick="switchPage('page-games')">
             <i class="fas fa-gamepad"></i><span>Spiele</span>
           </button>
+          <button class="mobile-nav-item" data-page="page-import" onclick="switchPage('page-import')">
+            <i class="fas fa-file-import"></i><span>Import</span>
+          </button>
         </nav>
 
         <script>
@@ -980,7 +999,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
 
           function switchPage(pageId) {
             // 1. Alle Seiten ausblenden
-            const pages = ['page-home', 'page-tracks', 'page-artists', 'page-minigames', 'page-games'];
+            const pages = ['page-home', 'page-tracks', 'page-artists', 'page-minigames', 'page-games', 'page-import'];
             pages.forEach(p => {
               const el = document.getElementById(p);
               if (el) el.style.display = 'none';
@@ -1017,7 +1036,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
               if (dropLimit) dropLimit.style.setProperty('display', 'none', 'important');
               if (dropRecent) dropRecent.style.setProperty('display', 'flex', 'important');
             } else {
-              // Bei Minigames fliegt die komplette Filterleiste raus
+              // Bei Minigames und Import fliegt die komplette Filterleiste raus
               if (filterBar) filterBar.style.setProperty('display', 'none', 'important');
             }
 
@@ -1518,6 +1537,29 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             if (time) time.innerText   = formatTime(localProgress);
           }, 1000);
 
+          async function handleSpotifyImport() {
+            const fileInput = document.getElementById('spotify-import-file');
+            const statusEl = document.getElementById('import-status');
+            if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+              statusEl.innerHTML = '<span style="color:#ff5252;">⚠️ Bitte zuerst eine JSON-Datei auswählen.</span>';
+              return;
+            }
+            statusEl.innerHTML = '<span style="color:#b3b3b3;">⏳ Wird hochgeladen…</span>';
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+            try {
+              const res = await fetch('/api/import/spotify', { method: 'POST', body: formData });
+              const data = await res.json();
+              if (res.ok) {
+                statusEl.innerHTML = '<span style="color:#1DB954;">✅ ' + (data.message || 'Import erfolgreich.') + '</span>';
+              } else {
+                statusEl.innerHTML = '<span style="color:#ff5252;">❌ ' + (data.error || 'Unbekannter Fehler.') + '</span>';
+              }
+            } catch (err) {
+              statusEl.innerHTML = '<span style="color:#ff5252;">❌ Netzwerkfehler: ' + err.message + '</span>';
+            }
+          }
+
           // ─── BEIM LADEN DER SEITE AUSFÜHREN ──────────────────────────────
           window.addEventListener('DOMContentLoaded', () => {
             const initialPage = "${currentPage}" || "page-home";
@@ -1532,6 +1574,87 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
   } catch (err) {
     res.send('Fehler beim Laden der Seite: ' + (err.message || 'Unbekannter Fehler'));
   }
+});
+
+// ─── POST /api/import/spotify ─────────────────────────────────────────────────
+app.post('/api/import/spotify', checkAndRefreshUserToken, upload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'Keine Datei empfangen.' });
+  }
+
+  let entries;
+  try {
+    entries = JSON.parse(req.file.buffer.toString('utf8'));
+  } catch {
+    return res.status(400).json({ error: 'Ungültiges JSON-Format.' });
+  }
+
+  if (!Array.isArray(entries)) {
+    return res.status(400).json({ error: 'Die JSON-Datei muss ein Array von Einträgen enthalten.' });
+  }
+
+  // Validierung: Spotify-Felder prüfen
+  const valid = entries.filter(e =>
+    e && typeof e === 'object' && typeof e.ts === 'string' && typeof e.master_metadata_track_name === 'string'
+  );
+
+  if (valid.length === 0) {
+    return res.status(400).json({ error: 'Keine gültigen Spotify-Einträge gefunden. Erwartet werden Felder: ts, master_metadata_track_name.' });
+  }
+
+  // Lokal-Schutz: ohne Cosmos DB nur validieren
+  if (!streamHistoryContainer) {
+    return res.status(200).json({
+      message: `Lokal-Modus: ${valid.length} Streams erfolgreich validiert, aber nicht in Cosmos DB gespeichert (keine Verbindung).`
+    });
+  }
+
+  const userId = req.session.spotifyUserId || 'unknown';
+
+  // Alle ts-Werte der zu importierenden Einträge sammeln
+  const candidateTs = valid.map(e => e.ts).filter(Boolean);
+
+  // Duplikate gegen Cosmos DB prüfen
+  const { resources: existingRows } = await streamHistoryContainer.items.query({
+    query: 'SELECT c.playedAt FROM c WHERE c.userId = @userId AND ARRAY_CONTAINS(@tsList, c.playedAt)',
+    parameters: [
+      { name: '@userId', value: userId },
+      { name: '@tsList', value: candidateTs }
+    ]
+  }).fetchAll();
+
+  const knownTs = new Set((existingRows || []).map(r => r.playedAt));
+  const newEntries = valid.filter(e => !knownTs.has(e.ts));
+
+  let inserted = 0;
+  let errors = 0;
+  for (const e of newEntries) {
+    const safeTs = String(e.ts).replace(/[:.]/g, '-');
+    const trackName = e.master_metadata_track_name || 'Unbekannt';
+    const artistName = e.master_metadata_album_artist_name || 'Unbekannt';
+    const albumName = e.master_metadata_album_album_name || null;
+    const msPlayed = typeof e.ms_played === 'number' ? e.ms_played : null;
+    try {
+      await streamHistoryContainer.items.create({
+        id: `${userId}_${safeTs}_import`,
+        userId,
+        playedAt: e.ts,
+        title: trackName,
+        artist: artistName,
+        album: albumName,
+        durationMs: msPlayed,
+        source: 'manual-import',
+        syncedAt: new Date().toISOString()
+      });
+      inserted++;
+    } catch {
+      errors++;
+    }
+  }
+
+  return res.status(200).json({
+    message: `Import abgeschlossen: ${inserted} neue Streams gespeichert, ${valid.length - newEntries.length} Duplikate übersprungen${errors > 0 ? ', ' + errors + ' Fehler.' : '.'}`
+  });
 });
 
 app.listen(port, () => console.log(`Server läuft auf http://127.0.0.1:${port}`));
