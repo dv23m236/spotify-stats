@@ -1,4 +1,3 @@
-
 param location string = resourceGroup().location
 param environmentName string
 @secure()
@@ -36,6 +35,17 @@ resource historyContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/co
     resource: {
       id: 'HistoricalStats'
       partitionKey: { paths: [ '/partitionKey' ], kind: 'Hash' }
+    }
+  }
+}
+
+resource streamHistoryContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2023-04-15' = {
+  parent: database
+  name: 'StreamHistory'
+  properties: {
+    resource: {
+      id: 'StreamHistory'
+      partitionKey: { paths: [ '/userId' ], kind: 'Hash' }
     }
   }
 }
