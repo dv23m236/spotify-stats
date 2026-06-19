@@ -424,7 +424,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           
           /* Grids & Cards */
           .section-title { font-size:24px; margin-top:40px; margin-bottom:25px; font-weight:700; letter-spacing:-0.5px; display:flex; align-items:center; gap:10px; }
-          .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:25px; margin-bottom:40px; }
+          .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:25px; margin-bottom:40px; }
           .card { background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.04); padding:18px; border-radius:16px; transition:all 0.3s cubic-bezier(0.4,0,0.2,1); text-align:center; position:relative; }
           .card:hover { background:rgba(255,255,255,0.06); border-color:rgba(255,255,255,0.1); transform:translateY(-5px); }
           .card img { width:100%; aspect-ratio:1; border-radius:10px; object-fit:cover; margin-bottom:14px; box-shadow:0 8px 20px rgba(0,0,0,0.4); }
@@ -670,239 +670,343 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             font-weight: 600;
           }
             
+          .mobile-bottom-nav { display:none; }
+            
           /* ==========================================
-             MODERN MOBILE MODE UPGRADE + LISTEN-LOOK
+             RESPONSIVE DESIGN – LIST MODE MOBILE
              ========================================== */
-          body.mobile-mode {
-            flex-direction: column !important;
-            display: flex !important;
-            background: #0c0c0c !important; /* Etwas tieferes Schwarz */
-          }
-          
-          /* Sidebar wird zur eleganten Top-Bar (kompakt) */
-          body.mobile-mode .sidebar {
-            width: 100% !important;
-            height: auto !important;
-            position: sticky !important;
-            top: 0 !important;
-            left: 0 !important;
-            border-right: none !important;
-            border-bottom: 1px solid rgba(255,255,255,0.08) !important;
-            padding: 15px 20px !important;
-            background: rgba(12, 12, 12, 0.85) !important;
-            backdrop-filter: blur(25px) !webkit-backdrop-filter: blur(25px) !important;
-            display: flex !important;
-            flex-direction: row !important;
-            justify-content: space-between !important;
-            align-items: center !important;
-            z-index: 999 !important;
-          }
-          
-          body.mobile-mode .logo-area {
-            margin-bottom: 0 !important;
-            padding-left: 0 !important;
-          }
+          @media (max-width: 768px) {
+            body {
+              flex-direction: column;
+              display: flex;
+              background: #0c0c0c;
+            }
 
-          body.mobile-mode .logo-area h2 {
-            font-size: 18px !important;
-          }
-          
-          /* Die Menüpunkte werden zu einer sauberen horizontalen Scroll-Leiste */
-          body.mobile-mode .nav-menu {
-            display: flex !important;
-            flex-direction: row !important;
-            gap: 6px !important;
-            overflow-x: auto !important;
-            white-space: nowrap !important;
-            padding-bottom: 3px !important;
-            max-width: 70% !important;
-            /* Versteckt die Scrollbar für sauberen Look */
-            -ms-overflow-style: none;
-            scrollbar-width: none;
-          }
-          body.mobile-mode .nav-menu::-webkit-scrollbar { display: none; }
-          
-          body.mobile-mode .nav-item {
-            margin-bottom: 0 !important;
-            padding: 8px 14px !important;
-            font-size: 12px !important;
-            background: rgba(255,255,255,0.04) !important;
-            border-radius: 20px !important;
-            display: inline-flex !important;
-            align-items: center !important;
-            gap: 8px !important;
-          }
+            .sidebar {
+              display: none !important;
+            }
 
-          body.mobile-mode #view-toggle-btn {
-            background: rgba(29, 185, 84, 0.1) !important;
-            color: #1DB954 !important;
-          }
-          
-          /* Hauptinhalt bekommt mehr Luft */
-          body.mobile-mode .main-content {
-            margin-left: 0 !important;
-            padding: 20px 15px 100px 15px !important;
-            width: 100% !important;
-          }
-          
-          /* Filterleiste stylen: Zeitfilter oben, Dropdowns elegant darunter */
-          body.mobile-mode .filter-bar {
-            flex-direction: column !important;
-            gap: 15px !important;
-            align-items: stretch !important;
-            width: 100% !important;
-          }
+            .main-content {
+              margin-left: 0 !important;
+              padding: 0.6rem 0.5rem 5.3rem !important;
+              width: 100% !important;
+            }
 
-          body.mobile-mode .tab-container {
-            width: 100% !important;
-            display: flex !important;
-            justify-content: space-between !important;
-          }
+            .section-title {
+              margin-top: 0.7rem !important;
+              margin-bottom: 0.45rem !important;
+              font-size: 1rem !important;
+            }
 
-          body.mobile-mode .tab-btn {
-            flex: 1 !important;
-            text-align: center !important;
-            padding: 8px 5px !important;
-            font-size: 12px !important;
-          }
+            .filter-bar {
+              flex-direction: column !important;
+              gap: 0.35rem !important;
+              align-items: stretch !important;
+              width: 100% !important;
+              margin-bottom: 0.5rem !important;
+              max-width: 30rem !important;
+              margin-left: auto !important;
+              margin-right: auto !important;
+            }
 
-          /* Dropdowns nebeneinander strecken */
-          body.mobile-mode .filter-bar > div:last-child {
-            display: flex !important;
-            width: 100% !important;
-            gap: 10px !important;
-          }
+            .tab-container {
+              width: 100% !important;
+              display: flex !important;
+              justify-content: space-between !important;
+              padding: 0.15rem !important;
+              gap: 0.2rem !important;
+            }
 
-          body.mobile-mode #dropdown-limit, 
-          body.mobile-mode #dropdown-recent {
-            flex: 1 !important;
-            justify-content: space-between !important;
-            background: rgba(255,255,255,0.03) !important;
-            padding: 8px 12px !important;
-            border-radius: 12px !important;
-            border: 1px solid rgba(255,255,255,0.05) !important;
-          }
-          
-          body.mobile-mode select {
-            background: transparent !important;
-            border: none !important;
-            padding: 0 !important;
-            font-size: 13px !important;
-          }
+            .tab-btn {
+              flex: 1 !important;
+              text-align: center !important;
+              padding: 0.35rem 0.15rem !important;
+              font-size: 0.7rem !important;
+            }
 
-          /* Live-Player auf Handys extrem schick machen */
-          body.mobile-mode .live-card {
-            flex-direction: row !important; /* Bild links, Text rechts statt Untereinander */
-            align-items: center !important;
-            text-align: left !important;
-            padding: 16px !important;
-            gap: 16px !important;
-          }
+            .filter-bar > div:last-child {
+              display: flex !important;
+              width: 100% !important;
+              gap: 0.35rem !important;
+            }
 
-          body.mobile-mode .cover-art {
-            width: 80px !important;
-            height: 80px !important;
-            border-radius: 8px !important;
-          }
+            #dropdown-limit,
+            #dropdown-recent {
+              flex: 1 !important;
+              justify-content: space-between !important;
+              background: rgba(255,255,255,0.03) !important;
+              padding: 0.3rem 0.45rem !important;
+              border-radius: 0.5rem !important;
+              border: 1px solid rgba(255,255,255,0.05) !important;
+            }
 
-          body.mobile-mode .track-name {
-            font-size: 18px !important;
-            line-height: 1.2 !important;
-          }
+            select {
+              background: transparent !important;
+              border: none !important;
+              padding: 0 !important;
+              font-size: 0.72rem !important;
+            }
 
-          body.mobile-mode .artist-name {
-            font-size: 14px !important;
-            margin-bottom: 8px !important;
-          }
+            #live-container,
+            .recent-list,
+            .grid {
+              max-width: 32rem !important;
+              margin-left: auto !important;
+              margin-right: auto !important;
+            }
 
-          body.mobile-mode .controls {
-            gap: 15px !important;
-          }
+            .live-card {
+              flex-direction: row !important;
+              align-items: center !important;
+              text-align: left !important;
+              padding: 0.5rem !important;
+              gap: 0.5rem !important;
+              border-radius: 0.6rem !important;
+            }
 
-          body.mobile-mode .ctrl-btn {
-            font-size: 18px !important;
-          }
+            .cover-art {
+              width: 3.4rem !important;
+              height: 3.4rem !important;
+              border-radius: 0.35rem !important;
+            }
 
-          body.mobile-mode .ctrl-btn.play {
-            font-size: 30px !important;
-          }
-          
-          /* Minispiele-Grid auf Mobilgeräten */
-          body.mobile-mode .higher-lower-grid {
-            grid-template-columns: 1fr !important;
-            gap: 15px !important;
-          }
+            .track-name {
+              font-size: 0.9rem !important;
+              line-height: 1.2 !important;
+              margin: 0.1rem 0 !important;
+            }
 
-          /* -------------------------------------------
-             AB HIER: NEUER ERGÄNZTER LISTEN-LOOK 
-             ------------------------------------------- */
+            .artist-name {
+              font-size: 0.78rem !important;
+              margin-bottom: 0.2rem !important;
+            }
 
-          /* Macht den Song-Verlauf (Home) zu einer sauberen Liste */
-          body.mobile-mode .recent-list {
-            display: flex !important;
-            flex-direction: column !important;
-            gap: 10px !important;
-            padding: 0 5px !important;
-          }
+            .controls {
+              gap: 0.55rem !important;
+              margin-bottom: 0.25rem !important;
+            }
 
-          body.mobile-mode .recent-item {
-            flex-direction: row !important; /* Bild links, Text rechts */
-            align-items: center !important;
-            background: rgba(255, 255, 255, 0.03) !important;
-            padding: 10px 12px !important;
-            border-radius: 8px !important;
-            gap: 15px !important;
-          }
+            .ctrl-btn {
+              font-size: 0.9rem !important;
+            }
 
-          body.mobile-mode .recent-item img {
-            width: 50px !important;
-            height: 50px !important;
-            border-radius: 4px !important;
-          }
+            .ctrl-btn.play {
+              font-size: 1.35rem !important;
+            }
 
-          body.mobile-mode .recent-info {
-            text-align: left !important;
-          }
+            .higher-lower-grid {
+              grid-template-columns: 1fr !important;
+              gap: 0.55rem !important;
+            }
 
-          body.mobile-mode .recent-title {
-            font-size: 14px !important;
-            font-weight: 600 !important;
-            margin-bottom: 2px !important;
-          }
+            .recent-list {
+              display: flex !important;
+              flex-direction: column !important;
+              gap: 0.35rem !important;
+              padding: 0 !important;
+            }
 
-          body.mobile-mode .recent-artist {
-            font-size: 12px !important;
-            color: #b3b3b3 !important;
-          }
+            .recent-item {
+              flex-direction: row !important;
+              align-items: center !important;
+              background: rgba(255,255,255,0.03) !important;
+              padding: 0.35rem 0.45rem !important;
+              border-radius: 0.5rem !important;
+              gap: 0.5rem !important;
+            }
 
-          /* Wandelt das große Kachel-Grid der Top-Listen in Zeilen um */
-          body.mobile-mode .grid {
-            display: flex !important;
-            flex-direction: column !important; /* Zeilen untereinander statt Grid */
-            gap: 10px !important;
-          }
+            .recent-item img {
+              width: 2.2rem !important;
+              height: 2.2rem !important;
+              border-radius: 0.35rem !important;
+            }
 
-          body.mobile-mode .card {
-            display: flex !important;
-            flex-direction: row !important; /* Bild links, Text rechts */
-            align-items: center !important;
-            padding: 10px 12px !important;
-            border-radius: 8px !important;
-            gap: 15px !important;
-            background: rgba(255, 255, 255, 0.03) !important;
-            text-align: left !important;
-          }
+            .recent-title {
+              font-size: 0.8rem !important;
+              font-weight: 600 !important;
+              margin-bottom: 0.05rem !important;
+            }
 
-          body.mobile-mode .card img {
-            width: 50px !important;
-            height: 50px !important;
-            border-radius: 4px !important;
-            object-fit: cover !important;
-          }
+            .recent-artist {
+              font-size: 0.72rem !important;
+              color: #b3b3b3 !important;
+            }
 
-          body.mobile-mode .card-title {
-            font-size: 14px !important;
-            font-weight: 600 !important;
+            /* Vertikale Listenzeilen fuer Top-Tracks/Artists */
+            .grid {
+              display: flex !important;
+              flex-direction: column !important;
+              gap: 0.35rem !important;
+              margin-bottom: 0.65rem !important;
+            }
+
+            .card {
+              width: 100% !important;
+              max-width: 32rem !important;
+              margin: 0 auto !important;
+              display: flex !important;
+              flex-direction: row !important;
+              align-items: center !important;
+              padding: 0.35rem 0.45rem !important;
+              border-radius: 0.6rem !important;
+              gap: 0.45rem !important;
+              background: rgba(255,255,255,0.05) !important;
+              text-align: left !important;
+              border: 1px solid rgba(255,255,255,0.05) !important;
+            }
+
+            .rank {
+              position: static !important;
+              background: transparent !important;
+              color: #f2f2f2 !important;
+              border-radius: 0 !important;
+              padding: 0 !important;
+              font-size: 1.05rem !important;
+              font-weight: 500 !important;
+              letter-spacing: 0 !important;
+              width: auto !important;
+              min-width: 0 !important;
+              margin-left: 12px !important;
+              margin-right: 12px !important;
+              text-align: left !important;
+              line-height: 1 !important;
+              flex-shrink: 0 !important;
+            }
+
+            .card img {
+              width: 2.55rem !important;
+              height: 2.55rem !important;
+              aspect-ratio: 1 / 1 !important;
+              border-radius: 0.4rem !important;
+              object-fit: cover !important;
+              margin: 0 !important;
+              box-shadow: none !important;
+              flex-shrink: 0 !important;
+            }
+
+            .card-meta {
+              min-width: 0 !important;
+              flex: 1 !important;
+              overflow: hidden !important;
+            }
+
+            .card-title {
+              width: 100% !important;
+              max-width: 100% !important;
+              font-size: 0.9rem !important;
+              font-weight: 600 !important;
+              line-height: 1.2 !important;
+              white-space: nowrap !important;
+              overflow: hidden !important;
+              text-overflow: ellipsis !important;
+              margin-bottom: 0 !important;
+            }
+
+            .card-sub {
+              width: 100% !important;
+              max-width: 100% !important;
+              font-size: 0.8rem !important;
+              line-height: 1.2 !important;
+              color: #9f9f9f !important;
+              white-space: nowrap !important;
+              overflow: hidden !important;
+              text-overflow: ellipsis !important;
+            }
+
+            /* Quiz-Bereich: komprimiert */
+            .hl-btn {
+              padding: 8px 12px !important;
+              font-size: 0.85rem !important;
+              margin: 4px !important;
+            }
+
+            #page-games > div:first-of-type {
+              gap: 8px !important;
+              margin-bottom: 12px !important;
+            }
+
+            .quiz-img {
+              max-width: 160px !important;
+              max-height: 160px !important;
+              width: 100% !important;
+              height: auto !important;
+            }
+
+            .quiz-img-wrapper {
+              margin-bottom: 12px !important;
+            }
+
+            .quiz-card h2 {
+              font-size: 1rem !important;
+              margin-bottom: 6px !important;
+              margin-top: 0 !important;
+            }
+
+            .quiz-card h3 {
+              font-size: 0.9rem !important;
+              margin: 8px 0 4px !important;
+            }
+
+            .quiz-card p {
+              font-size: 0.8rem !important;
+              margin-bottom: 10px !important;
+            }
+
+            .quiz-options {
+              gap: 6px !important;
+              margin-top: 10px !important;
+            }
+
+            .quiz-btn {
+              min-height: 44px !important;
+              padding: 8px 12px !important;
+              font-size: 0.82rem !important;
+            }
+
+            .quiz-card {
+              padding: 16px 14px !important;
+              margin: 8px auto !important;
+            }
+
+            .mobile-bottom-nav {
+              position: fixed;
+              left: 0;
+              right: 0;
+              bottom: 0;
+              height: 4.2rem;
+              background: rgba(10,10,10,0.96);
+              backdrop-filter: blur(14px);
+              -webkit-backdrop-filter: blur(14px);
+              border-top: 1px solid rgba(255,255,255,0.08);
+              display: flex;
+              align-items: center;
+              justify-content: space-around;
+              z-index: 1000;
+            }
+
+            .mobile-nav-item {
+              width: 25%;
+              height: 100%;
+              border: none;
+              background: transparent;
+              color: #9a9a9a;
+              display: inline-flex;
+              flex-direction: column;
+              align-items: center;
+              justify-content: center;
+              gap: 0.22rem;
+              font-size: 0.67rem;
+              font-weight: 600;
+              cursor: pointer;
+            }
+
+            .mobile-nav-item i {
+              font-size: 1rem;
+            }
+
+            .mobile-nav-item.active {
+              color: #1DB954;
+            }
           }
         </style>
       </head>
@@ -913,13 +1017,10 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
         <div class="sidebar">
           <div class="logo-area"><img src="https://upload.wikimedia.org/wikipedia/commons/1/19/Spotify_logo_without_text.svg" width="30"><h2>Insights.</h2></div>
           <ul class="nav-menu">
-            <li id="nav-page-home" class="nav-item active" onclick="switchPage('page-home')"><i class="fas fa-home"></i> Home</li>
-            <li id="nav-page-tracks" class="nav-item" onclick="switchPage('page-tracks')"><i class="fas fa-music"></i> Top Tracks</li>
-            <li id="nav-page-artists" class="nav-item" onclick="switchPage('page-artists')"><i class="fas fa-microphone"></i> Top Künstler</li>
-            <li id="nav-page-games" class="nav-item" onclick="switchPage('page-games')"><i class="fas fa-gamepad"></i> Minispiele</li>
-            
-            <li style="border-top: 1px solid rgba(255,255,255,0.1); margin: 15px 0; list-style: none;"></li>
-            <li id="view-toggle-btn" class="nav-item" style="cursor: pointer;"><i class="fas fa-mobile-alt"></i> Handy-Ansicht</li>
+            <li id="nav-page-home" data-page="page-home" class="nav-item active" onclick="switchPage('page-home')"><i class="fas fa-home"></i> Home</li>
+            <li id="nav-page-tracks" data-page="page-tracks" class="nav-item" onclick="switchPage('page-tracks')"><i class="fas fa-music"></i> Top Tracks</li>
+            <li id="nav-page-artists" data-page="page-artists" class="nav-item" onclick="switchPage('page-artists')"><i class="fas fa-microphone"></i> Top Künstler</li>
+            <li id="nav-page-games" data-page="page-games" class="nav-item" onclick="switchPage('page-games')"><i class="fas fa-gamepad"></i> Minispiele</li>
           </ul>
         </div>
         
@@ -974,7 +1075,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             <div class="grid">
               ${tracksArray.length > 0 ? tracksArray.map((t, i) => `
                 <div class="card"><span class="rank">#${i + 1}</span><img src="${t.album && t.album.images && t.album.images[0] ? t.album.images[0].url : 'https://via.placeholder.com/150'}">
-                  <div class="card-title">${t.name}</div><div class="card-sub">${t.artists && t.artists[0] ? t.artists[0].name : 'Künstler'}</div>
+                  <div class="card-meta"><div class="card-title">${t.name}</div><div class="card-sub">${t.artists && t.artists[0] ? t.artists[0].name : 'Künstler'}</div></div>
                 </div>`).join('') : '<p style="color:#535353; padding-left:15px;">Keine Daten verfügbar</p>'}
             </div>
           </div>
@@ -983,8 +1084,8 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             <h2 class="section-title"><i class="fas fa-microphone"></i> Deine Lieblingskünstler</h2>
             <div class="grid">
               ${artistsArray.length > 0 ? artistsArray.map((a, i) => `
-                <div class="card"><span class="rank">#${i + 1}</span><img src="${a.images && a.images[0] ? a.images[0].url : 'https://via.placeholder.com/150'}" style="border-radius:50%;">
-                  <div class="card-title">${a.name}</div><div class="card-sub">${a.genres && a.genres[0] ? a.genres[0] : 'Künstler'}</div>
+                <div class="card"><span class="rank">#${i + 1}</span><img src="${a.images && a.images[0] ? a.images[0].url : 'https://via.placeholder.com/150'}">
+                  <div class="card-meta"><div class="card-title">${a.name}</div><div class="card-sub">${a.genres && a.genres[0] ? a.genres[0] : 'Künstler'}</div></div>
                 </div>`).join('') : '<p style="color:#535353; padding-left:15px;">Keine Daten verfügbar</p>'}
             </div>
           </div>
@@ -1000,6 +1101,25 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             </div>
           </div>
         </div>
+
+        <nav class="mobile-bottom-nav">
+          <button class="mobile-nav-item active" data-page="page-home" onclick="switchPage('page-home')">
+            <i class="fas fa-house"></i>
+            <span>Home</span>
+          </button>
+          <button class="mobile-nav-item" data-page="page-tracks" onclick="switchPage('page-tracks')">
+            <i class="fas fa-music"></i>
+            <span>Songs</span>
+          </button>
+          <button class="mobile-nav-item" data-page="page-artists" onclick="switchPage('page-artists')">
+            <i class="fas fa-microphone"></i>
+            <span>Künstler</span>
+          </button>
+          <button class="mobile-nav-item" data-page="page-games" onclick="switchPage('page-games')">
+            <i class="fas fa-gamepad"></i>
+            <span>Spiele</span>
+          </button>
+        </nav>
 
         <script>
           let isPlayingLive = false, isFetchPending = false;
@@ -1023,23 +1143,11 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
               activePage.style.display = 'block';
             }
 
-            // 3. Aktiven Navigations-Punkt umschalten
-            const items = document.querySelectorAll('.nav-item');
-            items.forEach(item => item.classList.remove('active'));
-
-            if (pageId === 'page-home') {
-              const nav = document.getElementById('nav-home');
-              if (nav) nav.classList.add('active');
-            } else if (pageId === 'page-tracks') {
-              const nav = document.getElementById('nav-tracks');
-              if (nav) nav.classList.add('active');
-            } else if (pageId === 'page-artists') {
-              const nav = document.getElementById('nav-artists');
-              if (nav) nav.classList.add('active');
-            } else if (pageId === 'page-minigames' || pageId === 'page-games') {
-              const nav = document.getElementById('nav-minigames') || document.getElementById('nav-page-minigames');
-              if (nav) nav.classList.add('active');
-            }
+            // 3. Aktiven Navigations-Punkt umschalten (Sidebar + Mobile Bottom Nav)
+            const navItems = document.querySelectorAll('.nav-item[data-page], .mobile-nav-item[data-page]');
+            navItems.forEach(item => item.classList.remove('active'));
+            const activeItems = document.querySelectorAll('[data-page="' + pageId + '"]');
+            activeItems.forEach(item => item.classList.add('active'));
 
             // 4. KLUGE FILTER-STEUERUNG: Zeitfilter auf Home und Minigames komplett verstecken!
             const filterBar = document.getElementById('global-filter-bar');
@@ -1562,30 +1670,8 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             if (time) time.innerText   = formatTime(localProgress);
           }, 1000);
 
-          function toggleView() {
-            const body = document.body;
-            const btn = document.getElementById('view-toggle-btn');
-            
-            if (!body || !btn) return;
-
-            if (body.classList.contains('mobile-mode')) {
-              body.classList.remove('mobile-mode');
-              btn.innerHTML = '<i class="fas fa-mobile-alt"></i> Handy-Ansicht';
-              localStorage.setItem('preferredView', 'desktop');
-            } else {
-              body.classList.add('mobile-mode');
-              btn.innerHTML = '<i class="fas fa-desktop"></i> Desktop-Ansicht';
-              localStorage.setItem('preferredView', 'mobile');
-            }
-          }
-
           // ─── 2. BEIM LADEN DER SEITE AUSFÜHREN ─────────────────────────────
           window.addEventListener('DOMContentLoaded', () => {
-            const toggleBtn = document.getElementById('view-toggle-btn');
-            if (toggleBtn) {
-              toggleBtn.addEventListener('click', toggleView);
-            }
-
             // Holt die aktuelle Seite aus der Server-Variable und rendert sie verzögert nach 50ms
             const initialPage = "${currentPage}" || "page-home";
             setTimeout(() => {
@@ -1594,12 +1680,6 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             
             updateStatus();
             setInterval(updateStatus, 5000);
-
-            const savedView = localStorage.getItem('preferredView');
-            if (savedView === 'mobile') {
-              document.body.classList.add('mobile-mode');
-              if (toggleBtn) toggleBtn.innerHTML = '<i class="fas fa-desktop"></i> Desktop-Ansicht';
-            }
           });
         </script>
       </body>
