@@ -408,6 +408,105 @@ app.get('/api/now-playing', checkAndRefreshUserToken, async (req, res) => {
   }
 });
 
+// Monatsauswertung: Top-Tracks aggregiert aus StreamHistory (mit lokalem Mock-Fallback)
+app.get('/api/stats/month', checkAndRefreshUserToken, async (req, res) => {
+  const month = String(req.query.month || '').trim();
+  const monthMatch = month.match(/^(\d{4})-(\d{2})$/);
+  if (!monthMatch) {
+    return res.status(400).json({ error: 'Ungültiger Monat. Erwartet wird YYYY-MM.' });
+  }
+
+  const year = parseInt(monthMatch[1], 10);
+  const monthIndex = parseInt(monthMatch[2], 10) - 1;
+  if (monthIndex < 0 || monthIndex > 11) {
+    return res.status(400).json({ error: 'Ungültiger Monat.' });
+  }
+
+  const monthStart = new Date(Date.UTC(year, monthIndex, 1));
+  const monthEnd = new Date(Date.UTC(year, monthIndex + 1, 1));
+  const startIso = monthStart.toISOString();
+  const endIso = monthEnd.toISOString();
+
+  // Lokal-Schutz: Ohne Cosmos liefern wir Mock-Daten für Frontend-Tests.
+  if (!streamHistoryContainer) {
+    return res.status(200).json({
+      source: 'mock',
+      month,
+      tracks: [
+        {
+          rank: 1,
+          trackId: 'mock-track-1',
+          title: 'Midnight Pulse',
+          artist: 'Neon Harbor',
+          image: 'https://via.placeholder.com/150',
+          playCount: 42
+        },
+        {
+          rank: 2,
+          trackId: 'mock-track-2',
+          title: 'Static Hearts',
+          artist: 'Luma Drift',
+          image: 'https://via.placeholder.com/150',
+          playCount: 31
+        },
+        {
+          rank: 3,
+          trackId: 'mock-track-3',
+          title: 'Echo Avenue',
+          artist: 'Atlas Bloom',
+          image: 'https://via.placeholder.com/150',
+          playCount: 24
+        }
+      ]
+    });
+  }
+
+  try {
+    let userId = req.session.spotifyUserId;
+    if (!userId) {
+      const userApi = getUserSpotifyApi(req);
+      const me = await userApi.getMe();
+      userId = me?.body?.id;
+      if (userId) req.session.spotifyUserId = userId;
+    }
+
+    if (!userId) {
+      return res.status(400).json({ error: 'Spotify-User konnte nicht ermittelt werden.' });
+    }
+
+    const { resources } = await streamHistoryContainer.items.query({
+      query:
+        'SELECT c.trackId, c.title, c.artist, c.image, COUNT(1) AS playCount ' +
+        'FROM c ' +
+        'WHERE c.userId = @userId ' +
+        'AND c.playedAt >= @startIso ' +
+        'AND c.playedAt < @endIso ' +
+        'GROUP BY c.trackId, c.title, c.artist, c.image',
+      parameters: [
+        { name: '@userId', value: userId },
+        { name: '@startIso', value: startIso },
+        { name: '@endIso', value: endIso }
+      ]
+    }).fetchAll();
+
+    const tracks = (resources || [])
+      .map(r => ({
+        trackId: r.trackId || null,
+        title: r.title || 'Unbekannt',
+        artist: r.artist || 'Unbekannt',
+        image: r.image || 'https://via.placeholder.com/150',
+        playCount: Number(r.playCount || 0)
+      }))
+      .sort((a, b) => b.playCount - a.playCount)
+      .map((t, idx) => ({ ...t, rank: idx + 1 }));
+
+    return res.status(200).json({ source: 'cosmos', month, tracks });
+  } catch (err) {
+    console.error('--- [API] /api/stats/month Fehler:', err?.message || err);
+    return res.status(500).json({ error: 'Monatsauswertung konnte nicht geladen werden.' });
+  }
+});
+
 // ─── STATS DASHBOARD (Session-safe) ──────────────────────────────────────────
 app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
   try {
@@ -494,6 +593,18 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
 
     const base64QuizPool = Buffer.from(encodeURIComponent(JSON.stringify(quizPool))).toString('base64');
     const base64YearPool = Buffer.from(encodeURIComponent(JSON.stringify(yearPool))).toString('base64');
+    const currentTracksData = tracksArray.map(t => ({
+      title: t.name,
+      artist: t.artists && t.artists[0] ? t.artists[0].name : 'Künstler',
+      image: t.album && t.album.images && t.album.images[0] ? t.album.images[0].url : 'https://via.placeholder.com/150'
+    }));
+    const currentArtistsData = artistsArray.map(a => ({
+      name: a.name,
+      genre: a.genres && a.genres[0] ? a.genres[0] : 'Künstler',
+      image: a.images && a.images[0] ? a.images[0].url : 'https://via.placeholder.com/150'
+    }));
+    const base64CurrentTracks = Buffer.from(encodeURIComponent(JSON.stringify(currentTracksData))).toString('base64');
+    const base64CurrentArtists = Buffer.from(encodeURIComponent(JSON.stringify(currentArtistsData))).toString('base64');
 
     res.send(`
       <!DOCTYPE html>
@@ -561,6 +672,24 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           
           /* Grids & Cards */
           .section-title { font-size:24px; margin-top:40px; margin-bottom:25px; font-weight:700; letter-spacing:-0.5px; display:flex; align-items:center; gap:10px; }
+          .section-header { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-top:30px; margin-bottom:14px; }
+          .section-header .section-title { margin:0; }
+          .month-selector-wrap { display:flex; align-items:center; gap:8px; }
+          .month-selector-label { font-size:12px; font-weight:600; color:#b3b3b3; letter-spacing:0.3px; }
+          .month-selector {
+            background:rgba(255,255,255,0.06);
+            color:#fff;
+            border:1px solid rgba(255,255,255,0.12);
+            border-radius:999px;
+            padding:7px 12px;
+            font-family:'Poppins',sans-serif;
+            font-size:12px;
+            font-weight:600;
+            outline:none;
+            cursor:pointer;
+          }
+          .month-selector:focus { border-color:#1DB954; box-shadow:0 0 0 2px rgba(29,185,84,0.2); }
+          .month-status { color:#b3b3b3; font-size:12px; margin-bottom:12px; min-height:18px; }
           .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:25px; margin-bottom:40px; }
           .card { background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.04); padding:18px; border-radius:16px; transition:all 0.3s cubic-bezier(0.4,0,0.2,1); text-align:center; position:relative; }
           .card:hover { background:rgba(255,255,255,0.06); border-color:rgba(255,255,255,0.1); transform:translateY(-5px); }
@@ -818,6 +947,11 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             .sidebar { display:none !important; }
             .main-content { margin-left:0 !important; padding:0.6rem 0.5rem 5.3rem !important; width:100% !important; }
             .section-title { margin-top:0.7rem !important; margin-bottom:0.45rem !important; font-size:1rem !important; }
+            .section-header { margin-top:0.5rem !important; margin-bottom:0.4rem !important; gap:0.4rem !important; }
+            .month-selector-wrap { width:100% !important; justify-content:flex-start !important; }
+            .month-selector-label { font-size:0.72rem !important; }
+            .month-selector { width:100% !important; border-radius:0.5rem !important; padding:0.38rem 0.48rem !important; font-size:0.74rem !important; }
+            .month-status { font-size:0.72rem !important; margin-bottom:0.4rem !important; }
             .filter-bar { flex-direction:column !important; gap:0.35rem !important; align-items:stretch !important; width:100% !important; margin-bottom:0.5rem !important; max-width:30rem !important; margin-left:auto !important; margin-right:auto !important; }
             .tab-container { width:100% !important; display:flex !important; justify-content:space-between !important; padding:0.15rem !important; gap:0.2rem !important; }
             .tab-btn { flex:1 !important; text-align:center !important; padding:0.35rem 0.15rem !important; font-size:0.7rem !important; }
@@ -927,7 +1061,19 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           </div>
 
           <div id="page-tracks" class="app-page">
-            <h2 class="section-title"><i class="fas fa-music"></i> Deine Top Tracks</h2>
+            <div class="section-header">
+              <h2 class="section-title"><i class="fas fa-music"></i> Deine Top Tracks</h2>
+              <div class="month-selector-wrap">
+                <label class="month-selector-label" for="month-selector">Monat:</label>
+                <select id="month-selector" class="month-selector">
+                  <option value="current" selected>Aktuell (Spotify API)</option>
+                  <option value="2026-04">April 2026</option>
+                  <option value="2026-05">Mai 2026</option>
+                  <option value="2026-06">Juni 2026</option>
+                </select>
+              </div>
+            </div>
+            <div id="month-status-tracks" class="month-status"></div>
             <div class="grid">
               ${tracksArray.length > 0 ? tracksArray.map((t, i) => `
                 <div class="card"><span class="rank">#${i + 1}</span><img src="${t.album && t.album.images && t.album.images[0] ? t.album.images[0].url : 'https://via.placeholder.com/150'}">
@@ -937,7 +1083,19 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           </div>
 
           <div id="page-artists" class="app-page">
-            <h2 class="section-title"><i class="fas fa-microphone"></i> Deine Lieblingskünstler</h2>
+            <div class="section-header">
+              <h2 class="section-title"><i class="fas fa-microphone"></i> Deine Lieblingskünstler</h2>
+              <div class="month-selector-wrap">
+                <label class="month-selector-label" for="month-selector-artists">Monat:</label>
+                <select id="month-selector-artists" class="month-selector">
+                  <option value="current" selected>Aktuell (Spotify API)</option>
+                  <option value="2026-04">April 2026</option>
+                  <option value="2026-05">Mai 2026</option>
+                  <option value="2026-06">Juni 2026</option>
+                </select>
+              </div>
+            </div>
+            <div id="month-status-artists" class="month-status"></div>
             <div class="grid">
               ${artistsArray.length > 0 ? artistsArray.map((a, i) => `
                 <div class="card"><span class="rank">#${i + 1}</span><img src="${a.images && a.images[0] ? a.images[0].url : 'https://via.placeholder.com/150'}">
@@ -996,6 +1154,132 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
 
           const quizPool = JSON.parse(decodeURIComponent(atob("${base64QuizPool}")));
           const yearPool = JSON.parse(decodeURIComponent(atob("${base64YearPool}")));
+          const currentTracksData = JSON.parse(decodeURIComponent(atob("${base64CurrentTracks}")));
+          const currentArtistsData = JSON.parse(decodeURIComponent(atob("${base64CurrentArtists}")));
+
+          function escapeHtml(value) {
+            return String(value || '').replace(/[&<>'"]/g, (char) => {
+              const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' };
+              return map[char] || char;
+            });
+          }
+
+          function setMonthStatus(message, isError) {
+            const tracksStatus = document.getElementById('month-status-tracks');
+            const artistsStatus = document.getElementById('month-status-artists');
+            if (tracksStatus) {
+              tracksStatus.textContent = message || '';
+              tracksStatus.style.color = isError ? '#ff5252' : '#b3b3b3';
+            }
+            if (artistsStatus) {
+              artistsStatus.textContent = message || '';
+              artistsStatus.style.color = isError ? '#ff5252' : '#b3b3b3';
+            }
+          }
+
+          function renderTrackCards(trackItems) {
+            const grid = document.querySelector('#page-tracks .grid');
+            if (!grid) return;
+            if (!trackItems || trackItems.length === 0) {
+              grid.innerHTML = '<p style="color:#535353; padding-left:15px;">Keine Daten verfügbar</p>';
+              return;
+            }
+
+            grid.innerHTML = trackItems.map((t, i) => {
+              const title = escapeHtml(t.title || t.name || 'Unbekannt');
+              const artist = escapeHtml(t.artist || 'Künstler');
+              const image = escapeHtml(t.image || 'https://via.placeholder.com/150');
+              const playCount = Number(t.playCount || 0);
+              const subLine = playCount > 0 ? artist + ' • ' + playCount + ' Streams' : artist;
+              return '<div class="card">' +
+                '<span class="rank">#' + (i + 1) + '</span>' +
+                '<img src="' + image + '">' +
+                '<div class="card-meta"><div class="card-title">' + title + '</div><div class="card-sub">' + subLine + '</div></div>' +
+              '</div>';
+            }).join('');
+          }
+
+          function renderArtistCards(artistItems) {
+            const grid = document.querySelector('#page-artists .grid');
+            if (!grid) return;
+            if (!artistItems || artistItems.length === 0) {
+              grid.innerHTML = '<p style="color:#535353; padding-left:15px;">Keine Daten verfügbar</p>';
+              return;
+            }
+
+            grid.innerHTML = artistItems.map((a, i) => {
+              const name = escapeHtml(a.name || a.artist || 'Unbekannt');
+              const genreOrCount = escapeHtml(a.genre || (a.playCount ? a.playCount + ' Streams' : 'Künstler'));
+              const image = escapeHtml(a.image || 'https://via.placeholder.com/150');
+              return '<div class="card">' +
+                '<span class="rank">#' + (i + 1) + '</span>' +
+                '<img src="' + image + '">' +
+                '<div class="card-meta"><div class="card-title">' + name + '</div><div class="card-sub">' + genreOrCount + '</div></div>' +
+              '</div>';
+            }).join('');
+          }
+
+          function deriveArtistsFromTrackStats(trackItems) {
+            const map = new Map();
+            (trackItems || []).forEach(t => {
+              const artistName = t.artist || 'Unbekannt';
+              const current = map.get(artistName) || { name: artistName, image: t.image || 'https://via.placeholder.com/150', playCount: 0 };
+              current.playCount += Number(t.playCount || 0) || 1;
+              if (!current.image && t.image) current.image = t.image;
+              map.set(artistName, current);
+            });
+            return Array.from(map.values()).sort((a, b) => b.playCount - a.playCount);
+          }
+
+          async function loadHistoricalMonth(monthValue) {
+            setMonthStatus('Lade historische Monatsdaten…', false);
+            try {
+              const res = await fetch('/api/stats/month?month=' + encodeURIComponent(monthValue));
+              const data = await res.json();
+              if (!res.ok) {
+                throw new Error(data.error || 'Monatsauswertung fehlgeschlagen');
+              }
+              const tracks = Array.isArray(data.tracks) ? data.tracks : [];
+              renderTrackCards(tracks);
+              renderArtistCards(deriveArtistsFromTrackStats(tracks));
+              const [year, month] = monthValue.split('-');
+              const date = new Date(year, month - 1);
+              const formattedMonth = date.toLocaleDateString('de-DE', { month: 'long', year: 'numeric' });
+              setMonthStatus('Historische Ansicht aktiv: ' + formattedMonth, false);
+            } catch (err) {
+              setMonthStatus('Fehler beim Laden: ' + err.message, true);
+              renderTrackCards([]);
+              renderArtistCards([]);
+            }
+          }
+
+          function syncMonthSelectors(value) {
+            const tracksSelect = document.getElementById('month-selector');
+            const artistsSelect = document.getElementById('month-selector-artists');
+            if (tracksSelect && tracksSelect.value !== value) tracksSelect.value = value;
+            if (artistsSelect && artistsSelect.value !== value) artistsSelect.value = value;
+          }
+
+          let activeMonthValue = 'current';
+
+          async function handleMonthChange(value) {
+            const selected = value || 'current';
+            activeMonthValue = selected;
+            syncMonthSelectors(selected);
+            const tabContainer = document.querySelector('.tab-container');
+            const dropLimit = document.getElementById('dropdown-limit');
+            if (selected === 'current') {
+              if (tabContainer) tabContainer.style.display = '';
+              if (dropLimit) dropLimit.style.display = '';
+              renderTrackCards(currentTracksData);
+              renderArtistCards(currentArtistsData);
+              setMonthStatus('Aktuelle Spotify-Toplisten aktiv.', false);
+              return;
+            }
+            if (tabContainer) tabContainer.style.display = 'none';
+            if (dropLimit) dropLimit.style.display = 'none';
+            await loadHistoricalMonth(selected);
+          }
 
           function switchPage(pageId) {
             // 1. Alle Seiten ausblenden
@@ -1026,6 +1310,8 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
               if (filterBar) filterBar.style.setProperty('display', 'flex', 'important');
               if (dropLimit) dropLimit.style.setProperty('display', 'flex', 'important');
               if (dropRecent) dropRecent.style.setProperty('display', 'none', 'important');
+              // Aktiven Monat nach dem Seitenwechsel neu anwenden (historischer Modus bleibt erhalten)
+              setTimeout(function() { handleMonthChange(activeMonthValue); }, 0);
             } else if (pageId === 'page-home') {
               // Auf Home blenden wir die Zeit-Pillen aus, zeigen aber das Verlaufs-Limit rechts!
               if (filterBar) filterBar.style.setProperty('display', 'flex', 'important');
@@ -1564,6 +1850,19 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           window.addEventListener('DOMContentLoaded', () => {
             const initialPage = "${currentPage}" || "page-home";
             setTimeout(() => switchPage(initialPage), 50);
+            const monthSelector = document.getElementById('month-selector');
+            const monthSelectorArtists = document.getElementById('month-selector-artists');
+            if (monthSelector) {
+              monthSelector.addEventListener('change', function () {
+                handleMonthChange(this.value);
+              });
+            }
+            if (monthSelectorArtists) {
+              monthSelectorArtists.addEventListener('change', function () {
+                handleMonthChange(this.value);
+              });
+            }
+            handleMonthChange('current');
             updateStatus();
             setInterval(updateStatus, 5000);
           });
