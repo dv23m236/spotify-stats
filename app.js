@@ -3,7 +3,9 @@ require('dotenv').config(); // Lädt Variablen aus der .env-Datei (lokal) bzw. a
 const Express = require('express');
 const SpotifyWebApi = require('spotify-web-api-node');
 const { CosmosClient } = require('@azure/cosmos');
-const session = require('express-session'); // NEU: Session-Paket laden
+const session = require('express-session');
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 const app = Express();
 const port = process.env.PORT || 8000;
@@ -64,6 +66,7 @@ function getUserSpotifyApi(req) {
 const cosmosEndpoint = process.env.COSMOS_ENDPOINT;
 const cosmosKey = process.env.COSMOS_KEY;
 let cosmosContainer = null;
+let streamHistoryContainer = null;
 
 if (cosmosEndpoint && cosmosKey) {
   const client = new CosmosClient({ endpoint: cosmosEndpoint, key: cosmosKey });
@@ -74,7 +77,12 @@ if (cosmosEndpoint && cosmosKey) {
         id: 'HistoricalStats',
         partitionKey: { paths: ['/partitionKey'] }
       });
+      const { container: streamContainer } = await database.containers.createIfNotExists({
+        id: 'StreamHistory',
+        partitionKey: { paths: ['/userId'] }
+      });
       cosmosContainer = container;
+      streamHistoryContainer = streamContainer;
       console.log('--- [System] Cosmos DB erfolgreich initialisiert ---');
     } catch (err) {
       console.error('--- [Fehler] Cosmos DB Initialisierung fehlgeschlagen:', err);
@@ -105,6 +113,116 @@ function setCachedData(sessionId, type, key, data, ttlMs) {
     userCaches[sessionId][type] = { data, expires };
   }
 }
+
+// ─── BACKGROUND LIVE-TRACKING (4H INTERVALL) ─────────────────────────────────
+// Token-Registry: userId -> { accessToken, refreshToken, tokenExpires }
+// Wird beim Login befüllt und beim Token-Refresh aktualisiert.
+// Kein Zugriff auf den Session-Store – kein Konflikt mit dem Login-Flow.
+const tokenRegistry = new Map();
+
+const STREAM_SYNC_INTERVAL_MS = 4 * 60 * 60 * 1000;
+let streamSyncIsRunning = false;
+
+async function syncStreamHistoryForUser(userId, entry) {
+  const userApi = new SpotifyWebApi(spotifyCredentials);
+  userApi.setAccessToken(entry.accessToken);
+  userApi.setRefreshToken(entry.refreshToken);
+
+  // Token erneuern, falls er in weniger als 2 Minuten abläuft
+  if (entry.tokenExpires && Date.now() > entry.tokenExpires - 120000) {
+    if (!entry.refreshToken) throw new Error('Kein Refresh-Token für User ' + userId);
+    const refreshed = await userApi.refreshAccessToken();
+    entry.accessToken = refreshed.body['access_token'];
+    entry.tokenExpires = Date.now() + (refreshed.body['expires_in'] * 1000);
+    userApi.setAccessToken(entry.accessToken);
+    tokenRegistry.set(userId, entry);
+  }
+
+  let recent;
+  try {
+    recent = await userApi.getMyRecentlyPlayedTracks({ limit: 50 });
+  } catch (err) {
+    const unauthorized = err?.statusCode === 401 || String(err?.message || '').includes('The access token expired');
+    if (!unauthorized || !entry.refreshToken) throw err;
+    // Einmaliger Retry nach Token-Refresh
+    const refreshed = await userApi.refreshAccessToken();
+    entry.accessToken = refreshed.body['access_token'];
+    entry.tokenExpires = Date.now() + (refreshed.body['expires_in'] * 1000);
+    userApi.setAccessToken(entry.accessToken);
+    tokenRegistry.set(userId, entry);
+    recent = await userApi.getMyRecentlyPlayedTracks({ limit: 50 });
+  }
+
+  const items = recent?.body?.items || [];
+  if (items.length === 0) return;
+
+  const candidatePlayedAt = items.map(i => i.played_at).filter(Boolean);
+  if (candidatePlayedAt.length === 0) return;
+
+  const { resources: existingRows } = await streamHistoryContainer.items.query({
+    query: 'SELECT c.playedAt FROM c WHERE c.userId = @userId AND ARRAY_CONTAINS(@playedAtList, c.playedAt)',
+    parameters: [
+      { name: '@userId', value: userId },
+      { name: '@playedAtList', value: candidatePlayedAt }
+    ]
+  }).fetchAll();
+
+  const knownPlayedAt = new Set((existingRows || []).map(r => r.playedAt));
+  const newStreams = items.filter(i => i.played_at && !knownPlayedAt.has(i.played_at));
+
+  for (const item of newStreams) {
+    const track = item.track || {};
+    const playedAt = item.played_at;
+    const safePlayedAt = String(playedAt).replace(/[:.]/g, '-');
+    const trackId = track.id || 'unknown-track';
+    await streamHistoryContainer.items.create({
+      id: `${userId}_${safePlayedAt}_${trackId}`,
+      userId,
+      playedAt,
+      trackId,
+      title: track.name || 'Unbekannt',
+      artist: track.artists && track.artists[0] ? track.artists[0].name : 'Unbekannt',
+      album: track.album ? track.album.name : null,
+      image: track.album && track.album.images && track.album.images[0] ? track.album.images[0].url : null,
+      durationMs: track.duration_ms || null,
+      syncedAt: new Date().toISOString()
+    });
+  }
+
+  if (newStreams.length > 0) {
+    console.log(`--- [Cron] User ${userId}: ${newStreams.length} neue Streams gespeichert ---`);
+  }
+}
+
+async function runStreamHistorySyncJob() {
+  if (streamSyncIsRunning) {
+    console.log('--- [Cron] StreamHistory-Sync übersprungen: Job läuft bereits ---');
+    return;
+  }
+  if (!streamHistoryContainer) {
+    console.log('--- [Cron] StreamHistory-Sync übersprungen: Cosmos DB nicht verbunden (lokaler Modus oder fehlende Env-Variablen) ---');
+    return;
+  }
+  if (tokenRegistry.size === 0) {
+    console.log('--- [Cron] StreamHistory-Sync übersprungen: Keine eingeloggten User in der Registry ---');
+    return;
+  }
+
+  streamSyncIsRunning = true;
+  try {
+    for (const [userId, entry] of tokenRegistry.entries()) {
+      try {
+        await syncStreamHistoryForUser(userId, entry);
+      } catch (err) {
+        console.error(`--- [Cron] Fehler für User ${userId}:`, err?.message || err);
+      }
+    }
+  } finally {
+    streamSyncIsRunning = false;
+  }
+}
+
+setInterval(runStreamHistorySyncJob, STREAM_SYNC_INTERVAL_MS);
 
 // ─── LOGIN & REDIRECT ─────────────────────────────────────────────────────────
 app.get('/login', (req, res) => {
@@ -158,10 +276,29 @@ app.get('/', (req, res) => {
 
   // Tokens in der Session des jeweiligen Nutzers abspeichern!
   spotifyApiFactory.authorizationCodeGrant(code)
-    .then(data => {
+    .then(async data => {
       req.session.accessToken = data.body['access_token'];
       req.session.refreshToken = data.body['refresh_token'];
       req.session.tokenExpires = Date.now() + (data.body['expires_in'] * 1000);
+
+      // User-ID für den Hintergrund-Cron-Job ermitteln und in der Registry registrieren
+      try {
+        const tmpApi = new SpotifyWebApi(spotifyCredentials);
+        tmpApi.setAccessToken(req.session.accessToken);
+        const me = await tmpApi.getMe();
+        const userId = me?.body?.id;
+        if (userId) {
+          req.session.spotifyUserId = userId;
+          tokenRegistry.set(userId, {
+            accessToken: req.session.accessToken,
+            refreshToken: req.session.refreshToken,
+            tokenExpires: req.session.tokenExpires
+          });
+        }
+      } catch (regErr) {
+        console.error('--- [System] Token-Registry-Eintrag fehlgeschlagen:', regErr.message);
+      }
+
       res.redirect('/stats');
     })
     .catch(err => res.send('Fehler beim Login: ' + (err.message || JSON.stringify(err))));
@@ -271,6 +408,105 @@ app.get('/api/now-playing', checkAndRefreshUserToken, async (req, res) => {
   }
 });
 
+// Monatsauswertung: Top-Tracks aggregiert aus StreamHistory (mit lokalem Mock-Fallback)
+app.get('/api/stats/month', checkAndRefreshUserToken, async (req, res) => {
+  const month = String(req.query.month || '').trim();
+  const monthMatch = month.match(/^(\d{4})-(\d{2})$/);
+  if (!monthMatch) {
+    return res.status(400).json({ error: 'Ungültiger Monat. Erwartet wird YYYY-MM.' });
+  }
+
+  const year = parseInt(monthMatch[1], 10);
+  const monthIndex = parseInt(monthMatch[2], 10) - 1;
+  if (monthIndex < 0 || monthIndex > 11) {
+    return res.status(400).json({ error: 'Ungültiger Monat.' });
+  }
+
+  const monthStart = new Date(Date.UTC(year, monthIndex, 1));
+  const monthEnd = new Date(Date.UTC(year, monthIndex + 1, 1));
+  const startIso = monthStart.toISOString();
+  const endIso = monthEnd.toISOString();
+
+  // Lokal-Schutz: Ohne Cosmos liefern wir Mock-Daten für Frontend-Tests.
+  if (!streamHistoryContainer) {
+    return res.status(200).json({
+      source: 'mock',
+      month,
+      tracks: [
+        {
+          rank: 1,
+          trackId: 'mock-track-1',
+          title: 'Midnight Pulse',
+          artist: 'Neon Harbor',
+          image: 'https://via.placeholder.com/150',
+          playCount: 42
+        },
+        {
+          rank: 2,
+          trackId: 'mock-track-2',
+          title: 'Static Hearts',
+          artist: 'Luma Drift',
+          image: 'https://via.placeholder.com/150',
+          playCount: 31
+        },
+        {
+          rank: 3,
+          trackId: 'mock-track-3',
+          title: 'Echo Avenue',
+          artist: 'Atlas Bloom',
+          image: 'https://via.placeholder.com/150',
+          playCount: 24
+        }
+      ]
+    });
+  }
+
+  try {
+    let userId = req.session.spotifyUserId;
+    if (!userId) {
+      const userApi = getUserSpotifyApi(req);
+      const me = await userApi.getMe();
+      userId = me?.body?.id;
+      if (userId) req.session.spotifyUserId = userId;
+    }
+
+    if (!userId) {
+      return res.status(400).json({ error: 'Spotify-User konnte nicht ermittelt werden.' });
+    }
+
+    const { resources } = await streamHistoryContainer.items.query({
+      query:
+        'SELECT c.trackId, c.title, c.artist, c.image, COUNT(1) AS playCount ' +
+        'FROM c ' +
+        'WHERE c.userId = @userId ' +
+        'AND c.playedAt >= @startIso ' +
+        'AND c.playedAt < @endIso ' +
+        'GROUP BY c.trackId, c.title, c.artist, c.image',
+      parameters: [
+        { name: '@userId', value: userId },
+        { name: '@startIso', value: startIso },
+        { name: '@endIso', value: endIso }
+      ]
+    }).fetchAll();
+
+    const tracks = (resources || [])
+      .map(r => ({
+        trackId: r.trackId || null,
+        title: r.title || 'Unbekannt',
+        artist: r.artist || 'Unbekannt',
+        image: r.image || 'https://via.placeholder.com/150',
+        playCount: Number(r.playCount || 0)
+      }))
+      .sort((a, b) => b.playCount - a.playCount)
+      .map((t, idx) => ({ ...t, rank: idx + 1 }));
+
+    return res.status(200).json({ source: 'cosmos', month, tracks });
+  } catch (err) {
+    console.error('--- [API] /api/stats/month Fehler:', err?.message || err);
+    return res.status(500).json({ error: 'Monatsauswertung konnte nicht geladen werden.' });
+  }
+});
+
 // ─── STATS DASHBOARD (Session-safe) ──────────────────────────────────────────
 app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
   try {
@@ -357,6 +593,18 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
 
     const base64QuizPool = Buffer.from(encodeURIComponent(JSON.stringify(quizPool))).toString('base64');
     const base64YearPool = Buffer.from(encodeURIComponent(JSON.stringify(yearPool))).toString('base64');
+    const currentTracksData = tracksArray.map(t => ({
+      title: t.name,
+      artist: t.artists && t.artists[0] ? t.artists[0].name : 'Künstler',
+      image: t.album && t.album.images && t.album.images[0] ? t.album.images[0].url : 'https://via.placeholder.com/150'
+    }));
+    const currentArtistsData = artistsArray.map(a => ({
+      name: a.name,
+      genre: a.genres && a.genres[0] ? a.genres[0] : 'Künstler',
+      image: a.images && a.images[0] ? a.images[0].url : 'https://via.placeholder.com/150'
+    }));
+    const base64CurrentTracks = Buffer.from(encodeURIComponent(JSON.stringify(currentTracksData))).toString('base64');
+    const base64CurrentArtists = Buffer.from(encodeURIComponent(JSON.stringify(currentArtistsData))).toString('base64');
 
     res.send(`
       <!DOCTYPE html>
@@ -424,11 +672,30 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           
           /* Grids & Cards */
           .section-title { font-size:24px; margin-top:40px; margin-bottom:25px; font-weight:700; letter-spacing:-0.5px; display:flex; align-items:center; gap:10px; }
-          .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:25px; margin-bottom:40px; }
+          .section-header { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-top:30px; margin-bottom:14px; }
+          .section-header .section-title { margin:0; }
+          .month-selector-wrap { display:flex; align-items:center; gap:8px; }
+          .month-selector-label { font-size:12px; font-weight:600; color:#b3b3b3; letter-spacing:0.3px; }
+          .month-selector {
+            background:rgba(255,255,255,0.06);
+            color:#fff;
+            border:1px solid rgba(255,255,255,0.12);
+            border-radius:999px;
+            padding:7px 12px;
+            font-family:'Poppins',sans-serif;
+            font-size:12px;
+            font-weight:600;
+            outline:none;
+            cursor:pointer;
+          }
+          .month-selector:focus { border-color:#1DB954; box-shadow:0 0 0 2px rgba(29,185,84,0.2); }
+          .month-status { color:#b3b3b3; font-size:12px; margin-bottom:12px; min-height:18px; }
+          .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:25px; margin-bottom:40px; }
           .card { background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.04); padding:18px; border-radius:16px; transition:all 0.3s cubic-bezier(0.4,0,0.2,1); text-align:center; position:relative; }
           .card:hover { background:rgba(255,255,255,0.06); border-color:rgba(255,255,255,0.1); transform:translateY(-5px); }
           .card img { width:100%; aspect-ratio:1; border-radius:10px; object-fit:cover; margin-bottom:14px; box-shadow:0 8px 20px rgba(0,0,0,0.4); }
           .rank { position:absolute; top:10px; left:10px; background:#1DB954; color:black; font-weight:700; padding:2px 10px; border-radius:20px; font-size:11px; }
+          .card-meta { min-width:0; width:100%; }
           .card-title { font-weight:600; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:2px; }
           .card-sub { color:#b3b3b3; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
           
@@ -669,344 +936,66 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             margin-top: 10px;
             font-weight: 600;
           }
-            
+
           .mobile-bottom-nav { display:none; }
-            
+
           /* ==========================================
              RESPONSIVE DESIGN – LIST MODE MOBILE
              ========================================== */
           @media (max-width: 768px) {
-            body {
-              flex-direction: column;
-              display: flex;
-              background: #0c0c0c;
-            }
-
-            .sidebar {
-              display: none !important;
-            }
-
-            .main-content {
-              margin-left: 0 !important;
-              padding: 0.6rem 0.5rem 5.3rem !important;
-              width: 100% !important;
-            }
-
-            .section-title {
-              margin-top: 0.7rem !important;
-              margin-bottom: 0.45rem !important;
-              font-size: 1rem !important;
-            }
-
-            .filter-bar {
-              flex-direction: column !important;
-              gap: 0.35rem !important;
-              align-items: stretch !important;
-              width: 100% !important;
-              margin-bottom: 0.5rem !important;
-              max-width: 30rem !important;
-              margin-left: auto !important;
-              margin-right: auto !important;
-            }
-
-            .tab-container {
-              width: 100% !important;
-              display: flex !important;
-              justify-content: space-between !important;
-              padding: 0.15rem !important;
-              gap: 0.2rem !important;
-            }
-
-            .tab-btn {
-              flex: 1 !important;
-              text-align: center !important;
-              padding: 0.35rem 0.15rem !important;
-              font-size: 0.7rem !important;
-            }
-
-            .filter-bar > div:last-child {
-              display: flex !important;
-              width: 100% !important;
-              gap: 0.35rem !important;
-            }
-
-            #dropdown-limit,
-            #dropdown-recent {
-              flex: 1 !important;
-              justify-content: space-between !important;
-              background: rgba(255,255,255,0.03) !important;
-              padding: 0.3rem 0.45rem !important;
-              border-radius: 0.5rem !important;
-              border: 1px solid rgba(255,255,255,0.05) !important;
-            }
-
-            select {
-              background: transparent !important;
-              border: none !important;
-              padding: 0 !important;
-              font-size: 0.72rem !important;
-            }
-
-            #live-container,
-            .recent-list,
-            .grid {
-              max-width: 32rem !important;
-              margin-left: auto !important;
-              margin-right: auto !important;
-            }
-
-            .live-card {
-              flex-direction: row !important;
-              align-items: center !important;
-              text-align: left !important;
-              padding: 0.5rem !important;
-              gap: 0.5rem !important;
-              border-radius: 0.6rem !important;
-            }
-
-            .cover-art {
-              width: 3.4rem !important;
-              height: 3.4rem !important;
-              border-radius: 0.35rem !important;
-            }
-
-            .track-name {
-              font-size: 0.9rem !important;
-              line-height: 1.2 !important;
-              margin: 0.1rem 0 !important;
-            }
-
-            .artist-name {
-              font-size: 0.78rem !important;
-              margin-bottom: 0.2rem !important;
-            }
-
-            .controls {
-              gap: 0.55rem !important;
-              margin-bottom: 0.25rem !important;
-            }
-
-            .ctrl-btn {
-              font-size: 0.9rem !important;
-            }
-
-            .ctrl-btn.play {
-              font-size: 1.35rem !important;
-            }
-
-            .higher-lower-grid {
-              grid-template-columns: 1fr !important;
-              gap: 0.55rem !important;
-            }
-
-            .recent-list {
-              display: flex !important;
-              flex-direction: column !important;
-              gap: 0.35rem !important;
-              padding: 0 !important;
-            }
-
-            .recent-item {
-              flex-direction: row !important;
-              align-items: center !important;
-              background: rgba(255,255,255,0.03) !important;
-              padding: 0.35rem 0.45rem !important;
-              border-radius: 0.5rem !important;
-              gap: 0.5rem !important;
-            }
-
-            .recent-item img {
-              width: 2.2rem !important;
-              height: 2.2rem !important;
-              border-radius: 0.35rem !important;
-            }
-
-            .recent-title {
-              font-size: 0.8rem !important;
-              font-weight: 600 !important;
-              margin-bottom: 0.05rem !important;
-            }
-
-            .recent-artist {
-              font-size: 0.72rem !important;
-              color: #b3b3b3 !important;
-            }
-
-            /* Vertikale Listenzeilen fuer Top-Tracks/Artists */
-            .grid {
-              display: flex !important;
-              flex-direction: column !important;
-              gap: 0.35rem !important;
-              margin-bottom: 0.65rem !important;
-            }
-
-            .card {
-              width: 100% !important;
-              max-width: 32rem !important;
-              margin: 0 auto !important;
-              display: flex !important;
-              flex-direction: row !important;
-              align-items: center !important;
-              padding: 0.35rem 0.45rem !important;
-              border-radius: 0.6rem !important;
-              gap: 0.45rem !important;
-              background: rgba(255,255,255,0.05) !important;
-              text-align: left !important;
-              border: 1px solid rgba(255,255,255,0.05) !important;
-            }
-
-            .rank {
-              position: static !important;
-              background: transparent !important;
-              color: #f2f2f2 !important;
-              border-radius: 0 !important;
-              padding: 0 !important;
-              font-size: 1.05rem !important;
-              font-weight: 500 !important;
-              letter-spacing: 0 !important;
-              width: auto !important;
-              min-width: 0 !important;
-              margin-left: 12px !important;
-              margin-right: 12px !important;
-              text-align: left !important;
-              line-height: 1 !important;
-              flex-shrink: 0 !important;
-            }
-
-            .card img {
-              width: 2.55rem !important;
-              height: 2.55rem !important;
-              aspect-ratio: 1 / 1 !important;
-              border-radius: 0.4rem !important;
-              object-fit: cover !important;
-              margin: 0 !important;
-              box-shadow: none !important;
-              flex-shrink: 0 !important;
-            }
-
-            .card-meta {
-              min-width: 0 !important;
-              flex: 1 !important;
-              overflow: hidden !important;
-            }
-
-            .card-title {
-              width: 100% !important;
-              max-width: 100% !important;
-              font-size: 0.9rem !important;
-              font-weight: 600 !important;
-              line-height: 1.2 !important;
-              white-space: nowrap !important;
-              overflow: hidden !important;
-              text-overflow: ellipsis !important;
-              margin-bottom: 0 !important;
-            }
-
-            .card-sub {
-              width: 100% !important;
-              max-width: 100% !important;
-              font-size: 0.8rem !important;
-              line-height: 1.2 !important;
-              color: #9f9f9f !important;
-              white-space: nowrap !important;
-              overflow: hidden !important;
-              text-overflow: ellipsis !important;
-            }
-
-            /* Quiz-Bereich: komprimiert */
-            .hl-btn {
-              padding: 8px 12px !important;
-              font-size: 0.85rem !important;
-              margin: 4px !important;
-            }
-
-            #page-games > div:first-of-type {
-              gap: 8px !important;
-              margin-bottom: 12px !important;
-            }
-
-            .quiz-img {
-              max-width: 160px !important;
-              max-height: 160px !important;
-              width: 100% !important;
-              height: auto !important;
-            }
-
-            .quiz-img-wrapper {
-              margin-bottom: 12px !important;
-            }
-
-            .quiz-card h2 {
-              font-size: 1rem !important;
-              margin-bottom: 6px !important;
-              margin-top: 0 !important;
-            }
-
-            .quiz-card h3 {
-              font-size: 0.9rem !important;
-              margin: 8px 0 4px !important;
-            }
-
-            .quiz-card p {
-              font-size: 0.8rem !important;
-              margin-bottom: 10px !important;
-            }
-
-            .quiz-options {
-              gap: 6px !important;
-              margin-top: 10px !important;
-            }
-
-            .quiz-btn {
-              min-height: 44px !important;
-              padding: 8px 12px !important;
-              font-size: 0.82rem !important;
-            }
-
-            .quiz-card {
-              padding: 16px 14px !important;
-              margin: 8px auto !important;
-            }
-
-            .mobile-bottom-nav {
-              position: fixed;
-              left: 0;
-              right: 0;
-              bottom: 0;
-              height: 4.2rem;
-              background: rgba(10,10,10,0.96);
-              backdrop-filter: blur(14px);
-              -webkit-backdrop-filter: blur(14px);
-              border-top: 1px solid rgba(255,255,255,0.08);
-              display: flex;
-              align-items: center;
-              justify-content: space-around;
-              z-index: 1000;
-            }
-
-            .mobile-nav-item {
-              width: 25%;
-              height: 100%;
-              border: none;
-              background: transparent;
-              color: #9a9a9a;
-              display: inline-flex;
-              flex-direction: column;
-              align-items: center;
-              justify-content: center;
-              gap: 0.22rem;
-              font-size: 0.67rem;
-              font-weight: 600;
-              cursor: pointer;
-            }
-
-            .mobile-nav-item i {
-              font-size: 1rem;
-            }
-
-            .mobile-nav-item.active {
-              color: #1DB954;
-            }
+            body { flex-direction:column; display:flex; background:#0c0c0c; }
+            .sidebar { display:none !important; }
+            .main-content { margin-left:0 !important; padding:0.6rem 0.5rem 5.3rem !important; width:100% !important; }
+            .section-title { margin-top:0.7rem !important; margin-bottom:0.45rem !important; font-size:1rem !important; }
+            .section-header { margin-top:0.5rem !important; margin-bottom:0.4rem !important; gap:0.4rem !important; }
+            .month-selector-wrap { width:100% !important; justify-content:flex-start !important; }
+            .month-selector-label { font-size:0.72rem !important; }
+            .month-selector { width:100% !important; border-radius:0.5rem !important; padding:0.38rem 0.48rem !important; font-size:0.74rem !important; }
+            .month-status { font-size:0.72rem !important; margin-bottom:0.4rem !important; }
+            .filter-bar { flex-direction:column !important; gap:0.35rem !important; align-items:stretch !important; width:100% !important; margin-bottom:0.5rem !important; max-width:30rem !important; margin-left:auto !important; margin-right:auto !important; }
+            .tab-container { width:100% !important; display:flex !important; justify-content:space-between !important; padding:0.15rem !important; gap:0.2rem !important; }
+            .tab-btn { flex:1 !important; text-align:center !important; padding:0.35rem 0.15rem !important; font-size:0.7rem !important; }
+            .filter-bar > div:last-child { display:flex !important; width:100% !important; gap:0.35rem !important; }
+            #dropdown-limit, #dropdown-recent { flex:1 !important; justify-content:space-between !important; background:rgba(255,255,255,0.03) !important; padding:0.3rem 0.45rem !important; border-radius:0.5rem !important; border:1px solid rgba(255,255,255,0.05) !important; }
+            select { background:transparent !important; border:none !important; padding:0 !important; font-size:0.72rem !important; }
+            #live-container, .recent-list, .grid { max-width:32rem !important; margin-left:auto !important; margin-right:auto !important; }
+            .live-card { flex-direction:row !important; align-items:center !important; text-align:left !important; padding:0.5rem !important; gap:0.5rem !important; border-radius:0.6rem !important; }
+            .cover-art { width:3.4rem !important; height:3.4rem !important; border-radius:0.35rem !important; }
+            .track-name { font-size:0.9rem !important; line-height:1.2 !important; margin:0.1rem 0 !important; }
+            .artist-name { font-size:0.78rem !important; margin-bottom:0.2rem !important; }
+            .controls { gap:0.55rem !important; margin-bottom:0.25rem !important; }
+            .ctrl-btn { font-size:0.9rem !important; }
+            .ctrl-btn.play { font-size:1.35rem !important; }
+            .higher-lower-grid { grid-template-columns:1fr !important; gap:0.55rem !important; }
+            .recent-list { display:flex !important; flex-direction:column !important; gap:0.35rem !important; padding:0 !important; }
+            .recent-item { flex-direction:row !important; align-items:center !important; background:rgba(255,255,255,0.03) !important; padding:0.35rem 0.45rem !important; border-radius:0.5rem !important; gap:0.5rem !important; }
+            .recent-item img { width:2.2rem !important; height:2.2rem !important; border-radius:0.35rem !important; }
+            .recent-title { font-size:0.8rem !important; font-weight:600 !important; margin-bottom:0.05rem !important; }
+            .recent-artist { font-size:0.72rem !important; color:#b3b3b3 !important; }
+            /* Vertikale Listenzeilen */
+            .grid { display:flex !important; flex-direction:column !important; gap:0.35rem !important; margin-bottom:0.65rem !important; }
+            .card { width:100% !important; max-width:32rem !important; margin:0 auto !important; display:flex !important; flex-direction:row !important; align-items:center !important; padding:0.35rem 0.45rem !important; border-radius:0.6rem !important; gap:0.45rem !important; background:rgba(255,255,255,0.05) !important; text-align:left !important; border:1px solid rgba(255,255,255,0.05) !important; }
+            .rank { position:static !important; background:transparent !important; color:#f2f2f2 !important; border-radius:0 !important; padding:0 !important; font-size:1.05rem !important; font-weight:500 !important; letter-spacing:0 !important; width:auto !important; min-width:0 !important; margin-left:12px !important; margin-right:12px !important; text-align:left !important; line-height:1 !important; flex-shrink:0 !important; }
+            .card img { width:2.55rem !important; height:2.55rem !important; aspect-ratio:1/1 !important; border-radius:0.4rem !important; object-fit:cover !important; margin:0 !important; box-shadow:none !important; flex-shrink:0 !important; }
+            .card-meta { min-width:0 !important; flex:1 !important; overflow:hidden !important; }
+            .card-title { width:100% !important; max-width:100% !important; font-size:0.9rem !important; font-weight:600 !important; line-height:1.2 !important; white-space:nowrap !important; overflow:hidden !important; text-overflow:ellipsis !important; margin-bottom:0 !important; }
+            .card-sub { width:100% !important; max-width:100% !important; font-size:0.8rem !important; line-height:1.2 !important; color:#9f9f9f !important; white-space:nowrap !important; overflow:hidden !important; text-overflow:ellipsis !important; }
+            /* Quiz komprimiert */
+            .hl-btn { padding:8px 12px !important; font-size:0.85rem !important; margin:4px !important; }
+            #page-games > div:first-of-type { gap:8px !important; margin-bottom:12px !important; }
+            .quiz-img { max-width:160px !important; max-height:160px !important; width:100% !important; height:auto !important; }
+            .quiz-img-wrapper { margin-bottom:12px !important; }
+            .quiz-card h2 { font-size:1rem !important; margin-bottom:6px !important; margin-top:0 !important; }
+            .quiz-card h3 { font-size:0.9rem !important; margin:8px 0 4px !important; }
+            .quiz-card p { font-size:0.8rem !important; margin-bottom:10px !important; }
+            .quiz-options { gap:6px !important; margin-top:10px !important; }
+            .quiz-btn { min-height:44px !important; padding:8px 12px !important; font-size:0.82rem !important; }
+            .quiz-card { padding:16px 14px !important; margin:8px auto !important; }
+            /* Mobile Bottom Navigation */
+            .mobile-bottom-nav { position:fixed; left:0; right:0; bottom:0; height:4.2rem; background:rgba(10,10,10,0.96); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); border-top:1px solid rgba(255,255,255,0.08); display:flex; align-items:center; justify-content:space-around; z-index:1000; }
+            .mobile-nav-item { width:25%; height:100%; border:none; background:transparent; color:#9a9a9a; display:inline-flex; flex-direction:column; align-items:center; justify-content:center; gap:0.22rem; font-size:0.67rem; font-weight:600; cursor:pointer; }
+            .mobile-nav-item i { font-size:1rem; }
+            .mobile-nav-item.active { color:#1DB954; }
           }
         </style>
       </head>
@@ -1021,6 +1010,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             <li id="nav-page-tracks" data-page="page-tracks" class="nav-item" onclick="switchPage('page-tracks')"><i class="fas fa-music"></i> Top Tracks</li>
             <li id="nav-page-artists" data-page="page-artists" class="nav-item" onclick="switchPage('page-artists')"><i class="fas fa-microphone"></i> Top Künstler</li>
             <li id="nav-page-games" data-page="page-games" class="nav-item" onclick="switchPage('page-games')"><i class="fas fa-gamepad"></i> Minispiele</li>
+            <li id="nav-page-import" data-page="page-import" class="nav-item" onclick="switchPage('page-import')"><i class="fas fa-file-import"></i> Import</li>
           </ul>
         </div>
         
@@ -1071,7 +1061,19 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           </div>
 
           <div id="page-tracks" class="app-page">
-            <h2 class="section-title"><i class="fas fa-music"></i> Deine Top Tracks</h2>
+            <div class="section-header">
+              <h2 class="section-title"><i class="fas fa-music"></i> Deine Top Tracks</h2>
+              <div class="month-selector-wrap">
+                <label class="month-selector-label" for="month-selector">Monat:</label>
+                <select id="month-selector" class="month-selector">
+                  <option value="current" selected>Aktuell (Spotify API)</option>
+                  <option value="2026-04">April 2026</option>
+                  <option value="2026-05">Mai 2026</option>
+                  <option value="2026-06">Juni 2026</option>
+                </select>
+              </div>
+            </div>
+            <div id="month-status-tracks" class="month-status"></div>
             <div class="grid">
               ${tracksArray.length > 0 ? tracksArray.map((t, i) => `
                 <div class="card"><span class="rank">#${i + 1}</span><img src="${t.album && t.album.images && t.album.images[0] ? t.album.images[0].url : 'https://via.placeholder.com/150'}">
@@ -1081,7 +1083,19 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           </div>
 
           <div id="page-artists" class="app-page">
-            <h2 class="section-title"><i class="fas fa-microphone"></i> Deine Lieblingskünstler</h2>
+            <div class="section-header">
+              <h2 class="section-title"><i class="fas fa-microphone"></i> Deine Lieblingskünstler</h2>
+              <div class="month-selector-wrap">
+                <label class="month-selector-label" for="month-selector-artists">Monat:</label>
+                <select id="month-selector-artists" class="month-selector">
+                  <option value="current" selected>Aktuell (Spotify API)</option>
+                  <option value="2026-04">April 2026</option>
+                  <option value="2026-05">Mai 2026</option>
+                  <option value="2026-06">Juni 2026</option>
+                </select>
+              </div>
+            </div>
+            <div id="month-status-artists" class="month-status"></div>
             <div class="grid">
               ${artistsArray.length > 0 ? artistsArray.map((a, i) => `
                 <div class="card"><span class="rank">#${i + 1}</span><img src="${a.images && a.images[0] ? a.images[0].url : 'https://via.placeholder.com/150'}">
@@ -1100,24 +1114,36 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
               <p style="text-align:center; color:#b3b3b3;">Wähle oben ein Minispiel aus, um zu starten!</p>
             </div>
           </div>
+
+          <div id="page-import" class="app-page">
+            <h2 class="section-title"><i class="fas fa-file-import"></i> Spotify-Daten importieren</h2>
+            <div style="max-width:560px; margin:0 auto;">
+              <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); border-radius:16px; padding:32px;">
+                <p style="color:#b3b3b3; font-size:14px; line-height:1.6; margin-top:0;">Lade deine Streaming-Historie als JSON-Datei hoch (z.&nbsp;B. <code style='color:#1DB954;'>StreamingHistory_music_*.json</code> aus dem Spotify-Datenexport).</p>
+                <label style="display:block; margin-bottom:12px; font-size:13px; font-weight:600; color:#b3b3b3;">JSON-Datei auswählen</label>
+                <input type="file" id="spotify-import-file" accept=".json" style="display:block; width:100%; padding:10px 14px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); border-radius:10px; color:white; font-family:'Poppins',sans-serif; font-size:13px; cursor:pointer; margin-bottom:20px;">
+                <button onclick="handleSpotifyImport()" class="hl-btn" style="width:100%; justify-content:center;"><i class="fas fa-upload" style="margin-right:8px;"></i>Importieren</button>
+                <div id="import-status" style="margin-top:18px; font-size:13px; line-height:1.6;"></div>
+              </div>
+            </div>
+          </div>
         </div>
 
         <nav class="mobile-bottom-nav">
           <button class="mobile-nav-item active" data-page="page-home" onclick="switchPage('page-home')">
-            <i class="fas fa-house"></i>
-            <span>Home</span>
+            <i class="fas fa-house"></i><span>Home</span>
           </button>
           <button class="mobile-nav-item" data-page="page-tracks" onclick="switchPage('page-tracks')">
-            <i class="fas fa-music"></i>
-            <span>Songs</span>
+            <i class="fas fa-music"></i><span>Songs</span>
           </button>
           <button class="mobile-nav-item" data-page="page-artists" onclick="switchPage('page-artists')">
-            <i class="fas fa-microphone"></i>
-            <span>Künstler</span>
+            <i class="fas fa-microphone"></i><span>Künstler</span>
           </button>
           <button class="mobile-nav-item" data-page="page-games" onclick="switchPage('page-games')">
-            <i class="fas fa-gamepad"></i>
-            <span>Spiele</span>
+            <i class="fas fa-gamepad"></i><span>Spiele</span>
+          </button>
+          <button class="mobile-nav-item" data-page="page-import" onclick="switchPage('page-import')">
+            <i class="fas fa-file-import"></i><span>Import</span>
           </button>
         </nav>
 
@@ -1128,10 +1154,136 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
 
           const quizPool = JSON.parse(decodeURIComponent(atob("${base64QuizPool}")));
           const yearPool = JSON.parse(decodeURIComponent(atob("${base64YearPool}")));
+          const currentTracksData = JSON.parse(decodeURIComponent(atob("${base64CurrentTracks}")));
+          const currentArtistsData = JSON.parse(decodeURIComponent(atob("${base64CurrentArtists}")));
+
+          function escapeHtml(value) {
+            return String(value || '').replace(/[&<>'"]/g, (char) => {
+              const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' };
+              return map[char] || char;
+            });
+          }
+
+          function setMonthStatus(message, isError) {
+            const tracksStatus = document.getElementById('month-status-tracks');
+            const artistsStatus = document.getElementById('month-status-artists');
+            if (tracksStatus) {
+              tracksStatus.textContent = message || '';
+              tracksStatus.style.color = isError ? '#ff5252' : '#b3b3b3';
+            }
+            if (artistsStatus) {
+              artistsStatus.textContent = message || '';
+              artistsStatus.style.color = isError ? '#ff5252' : '#b3b3b3';
+            }
+          }
+
+          function renderTrackCards(trackItems) {
+            const grid = document.querySelector('#page-tracks .grid');
+            if (!grid) return;
+            if (!trackItems || trackItems.length === 0) {
+              grid.innerHTML = '<p style="color:#535353; padding-left:15px;">Keine Daten verfügbar</p>';
+              return;
+            }
+
+            grid.innerHTML = trackItems.map((t, i) => {
+              const title = escapeHtml(t.title || t.name || 'Unbekannt');
+              const artist = escapeHtml(t.artist || 'Künstler');
+              const image = escapeHtml(t.image || 'https://via.placeholder.com/150');
+              const playCount = Number(t.playCount || 0);
+              const subLine = playCount > 0 ? artist + ' • ' + playCount + ' Streams' : artist;
+              return '<div class="card">' +
+                '<span class="rank">#' + (i + 1) + '</span>' +
+                '<img src="' + image + '">' +
+                '<div class="card-meta"><div class="card-title">' + title + '</div><div class="card-sub">' + subLine + '</div></div>' +
+              '</div>';
+            }).join('');
+          }
+
+          function renderArtistCards(artistItems) {
+            const grid = document.querySelector('#page-artists .grid');
+            if (!grid) return;
+            if (!artistItems || artistItems.length === 0) {
+              grid.innerHTML = '<p style="color:#535353; padding-left:15px;">Keine Daten verfügbar</p>';
+              return;
+            }
+
+            grid.innerHTML = artistItems.map((a, i) => {
+              const name = escapeHtml(a.name || a.artist || 'Unbekannt');
+              const genreOrCount = escapeHtml(a.genre || (a.playCount ? a.playCount + ' Streams' : 'Künstler'));
+              const image = escapeHtml(a.image || 'https://via.placeholder.com/150');
+              return '<div class="card">' +
+                '<span class="rank">#' + (i + 1) + '</span>' +
+                '<img src="' + image + '">' +
+                '<div class="card-meta"><div class="card-title">' + name + '</div><div class="card-sub">' + genreOrCount + '</div></div>' +
+              '</div>';
+            }).join('');
+          }
+
+          function deriveArtistsFromTrackStats(trackItems) {
+            const map = new Map();
+            (trackItems || []).forEach(t => {
+              const artistName = t.artist || 'Unbekannt';
+              const current = map.get(artistName) || { name: artistName, image: t.image || 'https://via.placeholder.com/150', playCount: 0 };
+              current.playCount += Number(t.playCount || 0) || 1;
+              if (!current.image && t.image) current.image = t.image;
+              map.set(artistName, current);
+            });
+            return Array.from(map.values()).sort((a, b) => b.playCount - a.playCount);
+          }
+
+          async function loadHistoricalMonth(monthValue) {
+            setMonthStatus('Lade historische Monatsdaten…', false);
+            try {
+              const res = await fetch('/api/stats/month?month=' + encodeURIComponent(monthValue));
+              const data = await res.json();
+              if (!res.ok) {
+                throw new Error(data.error || 'Monatsauswertung fehlgeschlagen');
+              }
+              const tracks = Array.isArray(data.tracks) ? data.tracks : [];
+              renderTrackCards(tracks);
+              renderArtistCards(deriveArtistsFromTrackStats(tracks));
+              const [year, month] = monthValue.split('-');
+              const date = new Date(year, month - 1);
+              const formattedMonth = date.toLocaleDateString('de-DE', { month: 'long', year: 'numeric' });
+              setMonthStatus('Historische Ansicht aktiv: ' + formattedMonth, false);
+            } catch (err) {
+              setMonthStatus('Fehler beim Laden: ' + err.message, true);
+              renderTrackCards([]);
+              renderArtistCards([]);
+            }
+          }
+
+          function syncMonthSelectors(value) {
+            const tracksSelect = document.getElementById('month-selector');
+            const artistsSelect = document.getElementById('month-selector-artists');
+            if (tracksSelect && tracksSelect.value !== value) tracksSelect.value = value;
+            if (artistsSelect && artistsSelect.value !== value) artistsSelect.value = value;
+          }
+
+          let activeMonthValue = 'current';
+
+          async function handleMonthChange(value) {
+            const selected = value || 'current';
+            activeMonthValue = selected;
+            syncMonthSelectors(selected);
+            const tabContainer = document.querySelector('.tab-container');
+            const dropLimit = document.getElementById('dropdown-limit');
+            if (selected === 'current') {
+              if (tabContainer) tabContainer.style.display = '';
+              if (dropLimit) dropLimit.style.display = '';
+              renderTrackCards(currentTracksData);
+              renderArtistCards(currentArtistsData);
+              setMonthStatus('Aktuelle Spotify-Toplisten aktiv.', false);
+              return;
+            }
+            if (tabContainer) tabContainer.style.display = 'none';
+            if (dropLimit) dropLimit.style.display = 'none';
+            await loadHistoricalMonth(selected);
+          }
 
           function switchPage(pageId) {
             // 1. Alle Seiten ausblenden
-            const pages = ['page-home', 'page-tracks', 'page-artists', 'page-minigames', 'page-games'];
+            const pages = ['page-home', 'page-tracks', 'page-artists', 'page-minigames', 'page-games', 'page-import'];
             pages.forEach(p => {
               const el = document.getElementById(p);
               if (el) el.style.display = 'none';
@@ -1146,8 +1298,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             // 3. Aktiven Navigations-Punkt umschalten (Sidebar + Mobile Bottom Nav)
             const navItems = document.querySelectorAll('.nav-item[data-page], .mobile-nav-item[data-page]');
             navItems.forEach(item => item.classList.remove('active'));
-            const activeItems = document.querySelectorAll('[data-page="' + pageId + '"]');
-            activeItems.forEach(item => item.classList.add('active'));
+            document.querySelectorAll('[data-page="' + pageId + '"]').forEach(item => item.classList.add('active'));
 
             // 4. KLUGE FILTER-STEUERUNG: Zeitfilter auf Home und Minigames komplett verstecken!
             const filterBar = document.getElementById('global-filter-bar');
@@ -1159,6 +1310,8 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
               if (filterBar) filterBar.style.setProperty('display', 'flex', 'important');
               if (dropLimit) dropLimit.style.setProperty('display', 'flex', 'important');
               if (dropRecent) dropRecent.style.setProperty('display', 'none', 'important');
+              // Aktiven Monat nach dem Seitenwechsel neu anwenden (historischer Modus bleibt erhalten)
+              setTimeout(function() { handleMonthChange(activeMonthValue); }, 0);
             } else if (pageId === 'page-home') {
               // Auf Home blenden wir die Zeit-Pillen aus, zeigen aber das Verlaufs-Limit rechts!
               if (filterBar) filterBar.style.setProperty('display', 'flex', 'important');
@@ -1169,7 +1322,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
               if (dropLimit) dropLimit.style.setProperty('display', 'none', 'important');
               if (dropRecent) dropRecent.style.setProperty('display', 'flex', 'important');
             } else {
-              // Bei Minigames fliegt die komplette Filterleiste raus
+              // Bei Minigames und Import fliegt die komplette Filterleiste raus
               if (filterBar) filterBar.style.setProperty('display', 'none', 'important');
             }
 
@@ -1670,14 +1823,46 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             if (time) time.innerText   = formatTime(localProgress);
           }, 1000);
 
-          // ─── 2. BEIM LADEN DER SEITE AUSFÜHREN ─────────────────────────────
+          async function handleSpotifyImport() {
+            const fileInput = document.getElementById('spotify-import-file');
+            const statusEl = document.getElementById('import-status');
+            if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+              statusEl.innerHTML = '<span style="color:#ff5252;">⚠️ Bitte zuerst eine JSON-Datei auswählen.</span>';
+              return;
+            }
+            statusEl.innerHTML = '<span style="color:#b3b3b3;">⏳ Wird hochgeladen…</span>';
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+            try {
+              const res = await fetch('/api/import/spotify', { method: 'POST', body: formData });
+              const data = await res.json();
+              if (res.ok) {
+                statusEl.innerHTML = '<span style="color:#1DB954;">✅ ' + (data.message || 'Import erfolgreich.') + '</span>';
+              } else {
+                statusEl.innerHTML = '<span style="color:#ff5252;">❌ ' + (data.error || 'Unbekannter Fehler.') + '</span>';
+              }
+            } catch (err) {
+              statusEl.innerHTML = '<span style="color:#ff5252;">❌ Netzwerkfehler: ' + err.message + '</span>';
+            }
+          }
+
+          // ─── BEIM LADEN DER SEITE AUSFÜHREN ──────────────────────────────
           window.addEventListener('DOMContentLoaded', () => {
-            // Holt die aktuelle Seite aus der Server-Variable und rendert sie verzögert nach 50ms
             const initialPage = "${currentPage}" || "page-home";
-            setTimeout(() => {
-              switchPage(initialPage);
-            }, 50);
-            
+            setTimeout(() => switchPage(initialPage), 50);
+            const monthSelector = document.getElementById('month-selector');
+            const monthSelectorArtists = document.getElementById('month-selector-artists');
+            if (monthSelector) {
+              monthSelector.addEventListener('change', function () {
+                handleMonthChange(this.value);
+              });
+            }
+            if (monthSelectorArtists) {
+              monthSelectorArtists.addEventListener('change', function () {
+                handleMonthChange(this.value);
+              });
+            }
+            handleMonthChange('current');
             updateStatus();
             setInterval(updateStatus, 5000);
           });
@@ -1688,6 +1873,87 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
   } catch (err) {
     res.send('Fehler beim Laden der Seite: ' + (err.message || 'Unbekannter Fehler'));
   }
+});
+
+// ─── POST /api/import/spotify ─────────────────────────────────────────────────
+app.post('/api/import/spotify', checkAndRefreshUserToken, upload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'Keine Datei empfangen.' });
+  }
+
+  let entries;
+  try {
+    entries = JSON.parse(req.file.buffer.toString('utf8'));
+  } catch {
+    return res.status(400).json({ error: 'Ungültiges JSON-Format.' });
+  }
+
+  if (!Array.isArray(entries)) {
+    return res.status(400).json({ error: 'Die JSON-Datei muss ein Array von Einträgen enthalten.' });
+  }
+
+  // Validierung: Spotify-Felder prüfen
+  const valid = entries.filter(e =>
+    e && typeof e === 'object' && typeof e.ts === 'string' && typeof e.master_metadata_track_name === 'string'
+  );
+
+  if (valid.length === 0) {
+    return res.status(400).json({ error: 'Keine gültigen Spotify-Einträge gefunden. Erwartet werden Felder: ts, master_metadata_track_name.' });
+  }
+
+  // Lokal-Schutz: ohne Cosmos DB nur validieren
+  if (!streamHistoryContainer) {
+    return res.status(200).json({
+      message: `Lokal-Modus: ${valid.length} Streams erfolgreich validiert, aber nicht in Cosmos DB gespeichert (keine Verbindung).`
+    });
+  }
+
+  const userId = req.session.spotifyUserId || 'unknown';
+
+  // Alle ts-Werte der zu importierenden Einträge sammeln
+  const candidateTs = valid.map(e => e.ts).filter(Boolean);
+
+  // Duplikate gegen Cosmos DB prüfen
+  const { resources: existingRows } = await streamHistoryContainer.items.query({
+    query: 'SELECT c.playedAt FROM c WHERE c.userId = @userId AND ARRAY_CONTAINS(@tsList, c.playedAt)',
+    parameters: [
+      { name: '@userId', value: userId },
+      { name: '@tsList', value: candidateTs }
+    ]
+  }).fetchAll();
+
+  const knownTs = new Set((existingRows || []).map(r => r.playedAt));
+  const newEntries = valid.filter(e => !knownTs.has(e.ts));
+
+  let inserted = 0;
+  let errors = 0;
+  for (const e of newEntries) {
+    const safeTs = String(e.ts).replace(/[:.]/g, '-');
+    const trackName = e.master_metadata_track_name || 'Unbekannt';
+    const artistName = e.master_metadata_album_artist_name || 'Unbekannt';
+    const albumName = e.master_metadata_album_album_name || null;
+    const msPlayed = typeof e.ms_played === 'number' ? e.ms_played : null;
+    try {
+      await streamHistoryContainer.items.create({
+        id: `${userId}_${safeTs}_import`,
+        userId,
+        playedAt: e.ts,
+        title: trackName,
+        artist: artistName,
+        album: albumName,
+        durationMs: msPlayed,
+        source: 'manual-import',
+        syncedAt: new Date().toISOString()
+      });
+      inserted++;
+    } catch {
+      errors++;
+    }
+  }
+
+  return res.status(200).json({
+    message: `Import abgeschlossen: ${inserted} neue Streams gespeichert, ${valid.length - newEntries.length} Duplikate übersprungen${errors > 0 ? ', ' + errors + ' Fehler.' : '.'}`
+  });
 });
 
 app.listen(port, () => console.log(`Server läuft auf http://127.0.0.1:${port}`));
