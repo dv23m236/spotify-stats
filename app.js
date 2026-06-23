@@ -507,6 +507,26 @@ app.get('/api/stats/month', checkAndRefreshUserToken, async (req, res) => {
   }
 });
 
+// ─── HIGHSCORES (session-basiert, kein extra Cosmos-Container nötig) ──────────
+app.get('/api/highscores/me', checkAndRefreshUserToken, (req, res) => {
+  const hs = req.session.highscores || {};
+  return res.json({ quiz: Number(hs.quiz) || 0, slider: Number(hs.slider) || 0 });
+});
+
+app.post('/api/highscores', checkAndRefreshUserToken, Express.json(), (req, res) => {
+  const { game, score } = req.body || {};
+  const validGames = ['quiz', 'slider'];
+  if (!validGames.includes(game)) {
+    return res.status(400).json({ error: 'Ungültiges game. Erlaubt: quiz, slider.' });
+  }
+  const scoreInt = Math.max(0, Math.floor(Number(score) || 0));
+  if (!req.session.highscores) req.session.highscores = { quiz: 0, slider: 0 };
+  if (scoreInt > (Number(req.session.highscores[game]) || 0)) {
+    req.session.highscores[game] = scoreInt;
+  }
+  return res.json({ quiz: Number(req.session.highscores.quiz) || 0, slider: Number(req.session.highscores.slider) || 0 });
+});
+
 // ─── STATS DASHBOARD (Session-safe) ──────────────────────────────────────────
 app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
   try {
@@ -1156,6 +1176,148 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           const yearPool = JSON.parse(decodeURIComponent(atob("${base64YearPool}")));
           const currentTracksData = JSON.parse(decodeURIComponent(atob("${base64CurrentTracks}")));
           const currentArtistsData = JSON.parse(decodeURIComponent(atob("${base64CurrentArtists}")));
+          const highscoreState = { quiz: 0, slider: 0 };
+
+          function findFirstNumber(value) {
+            if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, Math.floor(value));
+            if (typeof value === 'string') {
+              const parsed = parseInt(value, 10);
+              if (Number.isFinite(parsed)) return Math.max(0, parsed);
+            }
+            return null;
+          }
+
+          function extractHighscoreValue(payload, game) {
+            if (!payload || typeof payload !== 'object') return null;
+            const gameKeys = game === 'quiz' ? ['quiz'] : ['slider', 'year'];
+            const directCandidates = [
+              payload[game],
+              payload[game + 'Highscore'],
+              payload[game + 'Score'],
+              payload[game + 'Best'],
+              payload.highscore,
+              payload.personalBest,
+              payload.bestScore,
+              payload.score
+            ];
+
+            for (const item of directCandidates) {
+              const n = findFirstNumber(item);
+              if (n !== null) return n;
+            }
+
+            for (const key of gameKeys) {
+              const nested = payload[key];
+              if (nested && typeof nested === 'object') {
+                const nestedCandidates = [nested.highscore, nested.personalBest, nested.bestScore, nested.score, nested.value];
+                for (const item of nestedCandidates) {
+                  const n = findFirstNumber(item);
+                  if (n !== null) return n;
+                }
+              }
+            }
+
+            if (Array.isArray(payload.items)) {
+              for (const entry of payload.items) {
+                if (!entry || typeof entry !== 'object') continue;
+                const gameName = String(entry.game || '').toLowerCase();
+                if (gameName && gameKeys.includes(gameName)) {
+                  const n = findFirstNumber(entry.highscore ?? entry.personalBest ?? entry.bestScore ?? entry.score ?? entry.value);
+                  if (n !== null) return n;
+                }
+              }
+            }
+
+            return null;
+          }
+
+          function updateHighscoreBadges() {
+            const quizSelectors = [
+              '#quiz-highscore', '#quiz-highscore-badge', '#quiz-live-score',
+              '[data-highscore-game="quiz"]', '[data-game="quiz"][data-role="highscore"]'
+            ];
+            const sliderSelectors = [
+              '#slider-highscore', '#slider-highscore-badge', '#year-highscore', '#year-live-score',
+              '[data-highscore-game="slider"]', '[data-game="slider"][data-role="highscore"]'
+            ];
+
+            quizSelectors.forEach((selector) => {
+              document.querySelectorAll(selector).forEach((el) => {
+                el.innerText = String(highscoreState.quiz);
+              });
+            });
+            sliderSelectors.forEach((selector) => {
+              document.querySelectorAll(selector).forEach((el) => {
+                el.innerText = String(highscoreState.slider);
+              });
+            });
+          }
+
+          async function loadDashboardData() {
+            try {
+              const res = await fetch('/api/highscores/me');
+              if (!res || !res.ok) return;
+              const data = await res.json();
+              const quizValue = extractHighscoreValue(data, 'quiz');
+              const sliderValue = extractHighscoreValue(data, 'slider');
+              if (quizValue !== null) highscoreState.quiz = quizValue;
+              if (sliderValue !== null) highscoreState.slider = sliderValue;
+              quizHighScore = highscoreState.quiz;
+              yearHighScore = highscoreState.slider;
+              updateHighscoreBadges();
+            } catch (err) {
+              console.error('Fehler beim Laden der Highscores:', err);
+            }
+          }
+
+          async function submitHighscore(game, score) {
+            const normalizedGame = game === 'slider' ? 'slider' : 'quiz';
+            const scoreNum = Math.max(0, parseInt(score, 10) || 0);
+            if (scoreNum <= 0) return;
+
+            try {
+              const res = await fetch('/api/highscores', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ game: normalizedGame, score: scoreNum })
+              });
+
+              if (!res || !res.ok) {
+                const fallbackBest = Math.max(
+                  normalizedGame === 'quiz' ? highscoreState.quiz : highscoreState.slider,
+                  scoreNum
+                );
+                if (normalizedGame === 'quiz') {
+                  highscoreState.quiz = fallbackBest;
+                  quizHighScore = fallbackBest;
+                } else {
+                  highscoreState.slider = fallbackBest;
+                  yearHighScore = fallbackBest;
+                }
+                updateHighscoreBadges();
+                return;
+              }
+
+              const data = await res.json();
+              const postedBest = extractHighscoreValue(data, normalizedGame);
+              const nextBest = Math.max(
+                normalizedGame === 'quiz' ? highscoreState.quiz : highscoreState.slider,
+                scoreNum,
+                postedBest === null ? 0 : postedBest
+              );
+
+              if (normalizedGame === 'quiz') {
+                highscoreState.quiz = nextBest;
+                quizHighScore = nextBest;
+              } else {
+                highscoreState.slider = nextBest;
+                yearHighScore = nextBest;
+              }
+              updateHighscoreBadges();
+            } catch (err) {
+              console.error('Fehler beim Speichern des Highscores:', err);
+            }
+          }
 
           function escapeHtml(value) {
             return String(value || '').replace(/[&<>'"]/g, (char) => {
@@ -1466,8 +1628,8 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
 
           // Quiz Engine
           let quizScore = 0;
-          let quizHighScore = localStorage.getItem('quizHighScore') ? parseInt(localStorage.getItem('quizHighScore')) : 0;
-          let yearHighScore = localStorage.getItem('yearHighScore') ? parseInt(localStorage.getItem('yearHighScore')) : 0;
+          let quizHighScore = 0;
+          let yearHighScore = 0;
 
           function startSongQuiz() {
             if (typeof quizPool !== 'undefined' && quizPool.length < 4) {
@@ -1637,10 +1799,10 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
               // Lädt die nächste Frage nach 1,5 Sekunden
               setTimeout(nextQuizQuestion, 1500);
             } else {
-              if (quizScore > quizHighScore) {
-                quizHighScore = quizScore;
-                localStorage.setItem('quizHighScore', quizHighScore);
-              }
+              const finalQuizScore = quizScore;
+              submitHighscore('quiz', finalQuizScore).catch((err) => {
+                console.error('Quiz-Highscore konnte nicht gespeichert werden:', err);
+              });
 
               // Game Over Screen einblenden
               setTimeout(() => {
@@ -1771,10 +1933,10 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
 
               setTimeout(nextYearQuestion, 1800);
             } else {
-              if (yearScore > yearHighScore) {
-                yearHighScore = yearScore;
-                localStorage.setItem('yearHighScore', yearHighScore);
-              }
+              const finalYearScore = yearScore;
+              submitHighscore('slider', finalYearScore).catch((err) => {
+                console.error('Slider-Highscore konnte nicht gespeichert werden:', err);
+              });
 
               setTimeout(() => {
                 const arena = document.getElementById('game-arena');
@@ -1850,6 +2012,9 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           window.addEventListener('DOMContentLoaded', () => {
             const initialPage = "${currentPage}" || "page-home";
             setTimeout(() => switchPage(initialPage), 50);
+            loadDashboardData().catch((err) => {
+              console.error('Dashboard-Daten konnten nicht geladen werden:', err);
+            });
             const monthSelector = document.getElementById('month-selector');
             const monthSelectorArtists = document.getElementById('month-selector-artists');
             if (monthSelector) {
