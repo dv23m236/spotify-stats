@@ -57,11 +57,13 @@ function decodeTokenBlob(rawValue) {
 function normalizeTokenDoc(doc) {
   if (!doc || typeof doc !== 'object') return null;
   const userId = String(doc.userId || spotifyUserId || 'default');
-  const accessToken = doc.accessToken || doc.spotifyAccessToken || null;
-  const refreshToken = doc.refreshToken || doc.spotifyRefreshToken || null;
-  const tokenExpires = Number(doc.tokenExpires || doc.tokenExpiresAt || doc.expiresAt || 0) || null;
+  const accessToken = doc.accessToken || doc.access_token || doc.spotifyAccessToken || null;
+  const refreshToken = doc.refreshToken || doc.refresh_token || doc.spotifyRefreshToken || null;
+  const rawTokenExpires = doc.tokenExpires ?? doc.tokenExpiresAt ?? doc.expiresAt ?? doc.expires_at ?? 0;
+  const normalizedTokenExpires = Number(rawTokenExpires);
+  const tokenExpires = Number.isFinite(normalizedTokenExpires) ? normalizedTokenExpires : null;
 
-  if (!accessToken) return null;
+  if (!accessToken && !refreshToken) return null;
 
   return {
     userId,
@@ -94,6 +96,8 @@ async function loadTokenDoc(context) {
       const tokenContainer = await getContainer(tokenContainerName, tokenPartitionKeyPath);
       if (tokenContainer) {
         const result = await tokenContainer.item(spotifyUserId, spotifyUserId).read();
+        console.log("DEBUG - Gesuchte Spotify User ID:", spotifyUserId);
+        console.log("DEBUG - Gefundenes Dokument aus Cosmos DB:", JSON.stringify(result?.resource, null, 2));
         const doc = normalizeTokenDoc(result?.resource);
         if (doc) {
           return {
@@ -140,7 +144,7 @@ async function persistTokenDocIfNeeded(tokenDoc, context) {
 }
 
 async function refreshTokensIfNeeded(tokenDoc, spotifyApi, context) {
-  const needsRefresh = tokenDoc.tokenExpires && Date.now() > tokenDoc.tokenExpires - 120000;
+  const needsRefresh = !tokenDoc.accessToken || !tokenDoc.tokenExpires || Date.now() > tokenDoc.tokenExpires - 120000;
   if (!needsRefresh || !tokenDoc.refreshToken) return tokenDoc;
 
   const refreshed = await spotifyApi.refreshAccessToken();
@@ -162,7 +166,7 @@ function buildSpotifyApi(tokenDoc) {
 
 async function syncRecentlyPlayedTracks(context) {
   const tokenDoc = await loadTokenDoc(context);
-  if (!tokenDoc || !tokenDoc.accessToken) {
+  if (!tokenDoc || (!tokenDoc.accessToken && !tokenDoc.refreshToken)) {
     context.log('Spotify-Tracking übersprungen: Kein Zugriffstoken gefunden.');
     return;
   }
