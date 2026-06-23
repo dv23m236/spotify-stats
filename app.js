@@ -62,10 +62,49 @@ function getUserSpotifyApi(req) {
   return userApi;
 }
 
+async function resolveSpotifyUserId(req, userApi) {
+  if (req.session && req.session.spotifyUserId) {
+    return req.session.spotifyUserId;
+  }
+  const api = userApi || getUserSpotifyApi(req);
+  const me = await api.getMe();
+  const userId = me?.body?.id || null;
+  if (userId && req.session) {
+    req.session.spotifyUserId = userId;
+  }
+  return userId;
+}
+
+async function readUserHighscoreDoc(userId) {
+  if (!usersContainer || !userId) return null;
+  try {
+    const result = await usersContainer.item(userId, userId).read();
+    return result?.resource || null;
+  } catch (err) {
+    if (err?.statusCode === 404 || err?.code === 404) return null;
+    throw err;
+  }
+}
+
+async function upsertUserHighscoreDoc(userId, currentDoc, nextValues) {
+  if (!usersContainer || !userId) return null;
+  const doc = {
+    id: userId,
+    userId,
+    quizHighscore: Number(nextValues.quizHighscore ?? currentDoc?.quizHighscore ?? 0) || 0,
+    sliderHighscore: Number(nextValues.sliderHighscore ?? currentDoc?.sliderHighscore ?? 0) || 0,
+    updatedAt: new Date().toISOString()
+  };
+  const payload = currentDoc ? { ...currentDoc, ...doc } : doc;
+  const result = await usersContainer.items.upsert(payload);
+  return result?.resource || payload;
+}
+
 // ─── AZURE COSMOS DB CONFIG ──────────────────────────────────────────────────
 const cosmosEndpoint = process.env.COSMOS_ENDPOINT;
 const cosmosKey = process.env.COSMOS_KEY;
 let cosmosContainer = null;
+let usersContainer = null;
 let streamHistoryContainer = null;
 
 if (cosmosEndpoint && cosmosKey) {
@@ -77,11 +116,16 @@ if (cosmosEndpoint && cosmosKey) {
         id: 'HistoricalStats',
         partitionKey: { paths: ['/partitionKey'] }
       });
+      const { container: userContainer } = await database.containers.createIfNotExists({
+        id: 'Users',
+        partitionKey: { paths: ['/userId'] }
+      });
       const { container: streamContainer } = await database.containers.createIfNotExists({
         id: 'StreamHistory',
         partitionKey: { paths: ['/userId'] }
       });
       cosmosContainer = container;
+      usersContainer = userContainer;
       streamHistoryContainer = streamContainer;
       console.log('--- [System] Cosmos DB erfolgreich initialisiert ---');
     } catch (err) {
@@ -175,7 +219,7 @@ async function syncStreamHistoryForUser(userId, entry) {
     const playedAt = item.played_at;
     const safePlayedAt = String(playedAt).replace(/[:.]/g, '-');
     const trackId = track.id || 'unknown-track';
-    await streamHistoryContainer.items.create({
+    await streamHistoryContainer.items.upsert({
       id: `${userId}_${safePlayedAt}_${trackId}`,
       userId,
       playedAt,
@@ -462,13 +506,7 @@ app.get('/api/stats/month', checkAndRefreshUserToken, async (req, res) => {
   }
 
   try {
-    let userId = req.session.spotifyUserId;
-    if (!userId) {
-      const userApi = getUserSpotifyApi(req);
-      const me = await userApi.getMe();
-      userId = me?.body?.id;
-      if (userId) req.session.spotifyUserId = userId;
-    }
+    const userId = await resolveSpotifyUserId(req, userApi);
 
     if (!userId) {
       return res.status(400).json({ error: 'Spotify-User konnte nicht ermittelt werden.' });
@@ -507,24 +545,100 @@ app.get('/api/stats/month', checkAndRefreshUserToken, async (req, res) => {
   }
 });
 
-// ─── HIGHSCORES (session-basiert, kein extra Cosmos-Container nötig) ──────────
-app.get('/api/highscores/me', checkAndRefreshUserToken, (req, res) => {
-  const hs = req.session.highscores || {};
-  return res.json({ quiz: Number(hs.quiz) || 0, slider: Number(hs.slider) || 0 });
+// ─── HIGHSCORES (Cosmos DB + lokaler Session-Fallback) ──────────────────────
+app.get('/api/highscores/me', checkAndRefreshUserToken, async (req, res) => {
+  const sessionFallback = req.session.highscores || {};
+
+  if (!usersContainer) {
+    return res.json({
+      quizHighscore: Number(sessionFallback.quiz) || 0,
+      sliderHighscore: Number(sessionFallback.slider) || 0
+    });
+  }
+
+  try {
+    const userId = await resolveSpotifyUserId(req);
+    if (!userId) {
+      return res.json({
+        quizHighscore: Number(sessionFallback.quiz) || 0,
+        sliderHighscore: Number(sessionFallback.slider) || 0
+      });
+    }
+
+    const doc = await readUserHighscoreDoc(userId);
+    if (doc) {
+      return res.json({
+        quizHighscore: Number(doc.quizHighscore) || 0,
+        sliderHighscore: Number(doc.sliderHighscore) || 0
+      });
+    }
+
+    return res.json({
+      quizHighscore: Number(sessionFallback.quiz) || 0,
+      sliderHighscore: Number(sessionFallback.slider) || 0
+    });
+  } catch (err) {
+    console.error('--- [API] /api/highscores/me Fehler:', err?.message || err);
+    return res.json({
+      quizHighscore: Number(sessionFallback.quiz) || 0,
+      sliderHighscore: Number(sessionFallback.slider) || 0
+    });
+  }
 });
 
-app.post('/api/highscores', checkAndRefreshUserToken, Express.json(), (req, res) => {
+app.post('/api/highscores', checkAndRefreshUserToken, Express.json(), async (req, res) => {
   const { game, score } = req.body || {};
   const validGames = ['quiz', 'slider'];
   if (!validGames.includes(game)) {
     return res.status(400).json({ error: 'Ungültiges game. Erlaubt: quiz, slider.' });
   }
+
   const scoreInt = Math.max(0, Math.floor(Number(score) || 0));
   if (!req.session.highscores) req.session.highscores = { quiz: 0, slider: 0 };
-  if (scoreInt > (Number(req.session.highscores[game]) || 0)) {
-    req.session.highscores[game] = scoreInt;
+
+  if (!usersContainer) {
+    if (scoreInt > (Number(req.session.highscores[game]) || 0)) {
+      req.session.highscores[game] = scoreInt;
+    }
+    return res.json({
+      quizHighscore: Number(req.session.highscores.quiz) || 0,
+      sliderHighscore: Number(req.session.highscores.slider) || 0
+    });
   }
-  return res.json({ quiz: Number(req.session.highscores.quiz) || 0, slider: Number(req.session.highscores.slider) || 0 });
+
+  try {
+    const userId = await resolveSpotifyUserId(req);
+    if (!userId) {
+      if (scoreInt > (Number(req.session.highscores[game]) || 0)) {
+        req.session.highscores[game] = scoreInt;
+      }
+      return res.json({
+        quizHighscore: Number(req.session.highscores.quiz) || 0,
+        sliderHighscore: Number(req.session.highscores.slider) || 0
+      });
+    }
+
+    const currentDoc = await readUserHighscoreDoc(userId);
+    const nextDoc = {
+      quizHighscore: Math.max(Number(currentDoc?.quizHighscore) || 0, game === 'quiz' ? scoreInt : 0),
+      sliderHighscore: Math.max(Number(currentDoc?.sliderHighscore) || 0, game === 'slider' ? scoreInt : 0)
+    };
+    const savedDoc = await upsertUserHighscoreDoc(userId, currentDoc, nextDoc);
+
+    return res.json({
+      quizHighscore: Number(savedDoc?.quizHighscore) || 0,
+      sliderHighscore: Number(savedDoc?.sliderHighscore) || 0
+    });
+  } catch (err) {
+    console.error('--- [API] /api/highscores Fehler:', err?.message || err);
+    if (scoreInt > (Number(req.session.highscores[game]) || 0)) {
+      req.session.highscores[game] = scoreInt;
+    }
+    return res.json({
+      quizHighscore: Number(req.session.highscores.quiz) || 0,
+      sliderHighscore: Number(req.session.highscores.slider) || 0
+    });
+  }
 });
 
 // ─── STATS DASHBOARD (Session-safe) ──────────────────────────────────────────
@@ -2073,7 +2187,10 @@ app.post('/api/import/spotify', checkAndRefreshUserToken, upload.single('file'),
     });
   }
 
-  const userId = req.session.spotifyUserId || 'unknown';
+  const userId = await resolveSpotifyUserId(req);
+  if (!userId) {
+    return res.status(400).json({ error: 'Spotify-User konnte nicht ermittelt werden.' });
+  }
 
   // Alle ts-Werte der zu importierenden Einträge sammeln
   const candidateTs = valid.map(e => e.ts).filter(Boolean);
@@ -2099,7 +2216,7 @@ app.post('/api/import/spotify', checkAndRefreshUserToken, upload.single('file'),
     const albumName = e.master_metadata_album_album_name || null;
     const msPlayed = typeof e.ms_played === 'number' ? e.ms_played : null;
     try {
-      await streamHistoryContainer.items.create({
+      await streamHistoryContainer.items.upsert({
         id: `${userId}_${safeTs}_import`,
         userId,
         playedAt: e.ts,

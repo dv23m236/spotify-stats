@@ -1,0 +1,17 @@
+{
+  "name": "spotify-tracking-function-app",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/functions/spotifyTimerTrigger.js",
+  "scripts": {
+    "start": "func start"
+  },
+  "dependencies": {
+    "@azure/cosmos": "^4.2.0",
+    "@azure/functions": "^4.7.0",
+    "spotify-web-api-node": "^5.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
