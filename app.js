@@ -378,11 +378,6 @@ app.get('/', (req, res) => {
       req.session.refreshToken = data.body['refresh_token'];
       req.session.tokenExpires = Date.now() + (data.body['expires_in'] * 1000);
 
-      console.log("================ Spotify Tokens ================");
-      console.log("REFRESH TOKEN:", data.body['refresh_token']);
-      console.log("ACCESS TOKEN:", data.body['access_token']);
-      console.log("================================================");
-
       // User-ID für den Hintergrund-Cron-Job ermitteln und in der Registry registrieren
       try {
         const tmpApi = new SpotifyWebApi(spotifyCredentials);
@@ -391,24 +386,6 @@ app.get('/', (req, res) => {
         const userId = me?.body?.id;
         if (userId) {
           req.session.spotifyUserId = userId;
-
-          if (tokenContainer) {
-            const tokenDoc = {
-              id: userId,
-              userId: userId,
-              refresh_token: req.session.refreshToken,
-              access_token: req.session.accessToken || "",
-              expires_at: Date.now() + ((data.body['expires_in'] || 3600) * 1000)
-            };
-
-            try {
-              await tokenContainer.items.upsert(tokenDoc);
-              console.log(`[CosmosDB] Tokens für User ${userId} erfolgreich gespeichert!`);
-            } catch (err) {
-              console.error("[CosmosDB] Fehler beim Speichern der Tokens:", err.message);
-            }
-          }
-
           tokenRegistry.set(userId, {
             accessToken: req.session.accessToken,
             refreshToken: req.session.refreshToken,
@@ -597,7 +574,7 @@ app.get('/api/stats/month', checkAndRefreshUserToken, async (req, res) => {
   }
 
   try {
-    const userId = await resolveSpotifyUserId(req, userApi);
+    const userId = await resolveSpotifyUserId(req);
 
     if (!userId) {
       return res.status(400).json({ error: 'Spotify-User konnte nicht ermittelt werden.' });
