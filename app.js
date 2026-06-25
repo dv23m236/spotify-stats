@@ -103,42 +103,52 @@ async function upsertUserHighscoreDoc(userId, currentDoc, nextValues) {
 // ─── AZURE COSMOS DB CONFIG ──────────────────────────────────────────────────
 const cosmosEndpoint = process.env.COSMOS_ENDPOINT;
 const cosmosKey = process.env.COSMOS_KEY;
-let cosmosContainer = null;
-let tokenContainer = null;
+const cosmosDatabaseName = process.env.COSMOS_DATABASE_NAME || 'SpotifyStats';
+const cosmosClient = cosmosEndpoint && cosmosKey
+  ? new CosmosClient({ endpoint: cosmosEndpoint, key: cosmosKey })
+  : null;
 let usersContainer = null;
 let streamHistoryContainer = null;
+let tokenContainer = null;
+let cosmosInitPromise = null;
 
-if (cosmosEndpoint && cosmosKey) {
-  const client = new CosmosClient({ endpoint: cosmosEndpoint, key: cosmosKey });
-  async function initCosmos() {
-    try {
-      const { database } = await client.databases.createIfNotExists({ id: 'SpotifyStats' });
-      const { container } = await database.containers.createIfNotExists({
-        id: 'HistoricalStats',
-        partitionKey: { paths: ['/partitionKey'] }
-      });
-      const { container: spotifyTokenContainer } = await database.containers.createIfNotExists({
-        id: 'SpotifyTokens',
-        partitionKey: { paths: ['/userId'] }
-      });
-      const { container: userContainer } = await database.containers.createIfNotExists({
-        id: 'Users',
-        partitionKey: { paths: ['/userId'] }
-      });
-      const { container: streamContainer } = await database.containers.createIfNotExists({
-        id: 'StreamHistory',
-        partitionKey: { paths: ['/userId'] }
-      });
-      cosmosContainer = container;
-      tokenContainer = spotifyTokenContainer;
-      usersContainer = userContainer;
-      streamHistoryContainer = streamContainer;
-      console.log('--- [System] Cosmos DB erfolgreich initialisiert ---');
-    } catch (err) {
-      console.error('--- [Fehler] Cosmos DB Initialisierung fehlgeschlagen:', err);
-    }
+async function ensureCosmosInitialized() {
+  if (!cosmosClient) return false;
+  if (usersContainer && streamHistoryContainer && tokenContainer) return true;
+
+  if (!cosmosInitPromise) {
+    cosmosInitPromise = (async () => {
+      try {
+        const { database } = await cosmosClient.databases.createIfNotExists({ id: cosmosDatabaseName });
+        const { container: userContainer } = await database.containers.createIfNotExists({
+          id: 'Users',
+          partitionKey: { paths: ['/userId'] }
+        });
+        const { container: streamContainer } = await database.containers.createIfNotExists({
+          id: 'StreamHistory',
+          partitionKey: { paths: ['/userId'] }
+        });
+        const { container: spotifyTokenContainer } = await database.containers.createIfNotExists({
+          id: 'SpotifyTokens',
+          partitionKey: { paths: ['/userId'] }
+        });
+        usersContainer = userContainer;
+        streamHistoryContainer = streamContainer;
+        tokenContainer = spotifyTokenContainer;
+        console.log(`--- [System] Cosmos DB erfolgreich initialisiert (DB: ${cosmosDatabaseName}) ---`);
+        return true;
+      } catch (err) {
+        console.error('--- [Fehler] Cosmos DB Initialisierung fehlgeschlagen:', err);
+        return false;
+      }
+    })();
   }
-  initCosmos();
+
+  return cosmosInitPromise;
+}
+
+if (cosmosClient) {
+  ensureCosmosInitialized();
 } else {
   console.log('--- [System] Lokaler Modus ohne Azure Cosmos DB (Variablen fehlen) ---');
 }
@@ -173,6 +183,31 @@ const tokenRegistry = new Map();
 const STREAM_SYNC_INTERVAL_MS = 4 * 60 * 60 * 1000;
 let streamSyncIsRunning = false;
 
+async function persistSpotifyTokenDocument(userId, tokenData, sourceLabel = 'app') {
+  if (!userId || !tokenData) return;
+  if (!tokenContainer) {
+    await ensureCosmosInitialized();
+  }
+  if (!tokenContainer) return;
+
+  const accessToken = tokenData.accessToken || null;
+  const refreshToken = tokenData.refreshToken || null;
+  const tokenExpires = Number(tokenData.tokenExpires || 0) || null;
+
+  await tokenContainer.items.upsert({
+    id: userId,
+    userId,
+    accessToken,
+    refreshToken,
+    tokenExpires,
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    expires_at: tokenExpires,
+    source: sourceLabel,
+    updatedAt: new Date().toISOString()
+  });
+}
+
 async function syncStreamHistoryForUser(userId, entry) {
   const userApi = new SpotifyWebApi(spotifyCredentials);
   userApi.setAccessToken(entry.accessToken);
@@ -183,9 +218,15 @@ async function syncStreamHistoryForUser(userId, entry) {
     if (!entry.refreshToken) throw new Error('Kein Refresh-Token für User ' + userId);
     const refreshed = await userApi.refreshAccessToken();
     entry.accessToken = refreshed.body['access_token'];
+    entry.refreshToken = refreshed.body['refresh_token'] || entry.refreshToken;
     entry.tokenExpires = Date.now() + (refreshed.body['expires_in'] * 1000);
     userApi.setAccessToken(entry.accessToken);
     tokenRegistry.set(userId, entry);
+    try {
+      await persistSpotifyTokenDocument(userId, entry, 'app-cron-refresh');
+    } catch (persistErr) {
+      console.error(`--- [Cron] Token-Persistenz fehlgeschlagen für User ${userId}:`, persistErr?.message || persistErr);
+    }
   }
 
   let recent;
@@ -197,9 +238,15 @@ async function syncStreamHistoryForUser(userId, entry) {
     // Einmaliger Retry nach Token-Refresh
     const refreshed = await userApi.refreshAccessToken();
     entry.accessToken = refreshed.body['access_token'];
+    entry.refreshToken = refreshed.body['refresh_token'] || entry.refreshToken;
     entry.tokenExpires = Date.now() + (refreshed.body['expires_in'] * 1000);
     userApi.setAccessToken(entry.accessToken);
     tokenRegistry.set(userId, entry);
+    try {
+      await persistSpotifyTokenDocument(userId, entry, 'app-cron-retry-refresh');
+    } catch (persistErr) {
+      console.error(`--- [Cron] Token-Persistenz (Retry) fehlgeschlagen für User ${userId}:`, persistErr?.message || persistErr);
+    }
     recent = await userApi.getMyRecentlyPlayedTracks({ limit: 50 });
   }
 
@@ -367,6 +414,16 @@ app.get('/', (req, res) => {
             refreshToken: req.session.refreshToken,
             tokenExpires: req.session.tokenExpires
           });
+          try {
+            await persistSpotifyTokenDocument(userId, {
+              accessToken: req.session.accessToken,
+              refreshToken: req.session.refreshToken,
+              tokenExpires: req.session.tokenExpires
+            }, 'app-login');
+            console.log(`--- [System] Spotify-Token in Cosmos gespeichert für User ${userId} ---`);
+          } catch (tokenPersistErr) {
+            console.error(`--- [System] Spotify-Token konnte nicht gespeichert werden für User ${userId}:`, tokenPersistErr?.message || tokenPersistErr);
+          }
         }
       } catch (regErr) {
         console.error('--- [System] Token-Registry-Eintrag fehlgeschlagen:', regErr.message);
@@ -388,7 +445,26 @@ async function checkAndRefreshUserToken(req, res, next) {
       const userApi = getUserSpotifyApi(req);
       const data = await userApi.refreshAccessToken();
       req.session.accessToken = data.body['access_token'];
-      req.session.tokenExpires = Date.now() + (3600 * 1000);
+      req.session.refreshToken = data.body['refresh_token'] || req.session.refreshToken;
+      req.session.tokenExpires = Date.now() + ((Number(data.body['expires_in']) || 3600) * 1000);
+
+      if (req.session.spotifyUserId) {
+        tokenRegistry.set(req.session.spotifyUserId, {
+          accessToken: req.session.accessToken,
+          refreshToken: req.session.refreshToken,
+          tokenExpires: req.session.tokenExpires
+        });
+        try {
+          await persistSpotifyTokenDocument(req.session.spotifyUserId, {
+            accessToken: req.session.accessToken,
+            refreshToken: req.session.refreshToken,
+            tokenExpires: req.session.tokenExpires
+          }, 'app-session-refresh');
+        } catch (tokenPersistErr) {
+          console.error(`--- [System] Spotify-Token konnte nach Refresh nicht gespeichert werden (${req.session.spotifyUserId}):`, tokenPersistErr?.message || tokenPersistErr);
+        }
+      }
+
       console.log(`--- [System] Token für Session ${req.session.id} erneuert ---`);
     } catch (err) {
       console.error('Fehler beim automatischen User-Token-Refresh:', err.message);
@@ -429,20 +505,6 @@ app.get('/api/now-playing', checkAndRefreshUserToken, async (req, res) => {
     const data = await userApi.getMyCurrentPlayingTrack().catch(() => null);
     if (data && data.body && data.body.item) {
       const track = data.body.item;
-      
-      // Hintergrund-Cosmos-Sync (nur wenn DB an ist)
-      if (cosmosContainer) {
-        if (req.session.lastTrackId !== track.id) {
-          req.session.lastTrackId = track.id;
-          await cosmosContainer.items.create({
-            id: track.id + "_" + Date.now(),
-            title: track.name,
-            artist: track.artists[0].name,
-            playedAt: new Date().toISOString(),
-            partitionKey: 'spotify-history'
-          }).catch(() => null);
-        }
-      }
 
       return res.json({
         hasActiveSession: true,

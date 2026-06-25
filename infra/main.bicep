@@ -28,17 +28,6 @@ resource database 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases@2023-04-15
   properties: { resource: { id: 'SpotifyStats' } }
 }
 
-resource historyContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2023-04-15' = {
-  parent: database
-  name: 'HistoricalStats'
-  properties: {
-    resource: {
-      id: 'HistoricalStats'
-      partitionKey: { paths: [ '/partitionKey' ], kind: 'Hash' }
-    }
-  }
-}
-
 resource streamHistoryContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2023-04-15' = {
   parent: database
   name: 'StreamHistory'
@@ -75,6 +64,7 @@ resource appService 'Microsoft.Web/sites@2023-01-01' = {
         // Auch hier nutzen wir die Variable, damit die Web-App die richtige DB findet
         { name: 'COSMOS_ENDPOINT', value: cosmosAccount.properties.documentEndpoint }
         { name: 'COSMOS_KEY', value: cosmosAccount.listKeys().primaryMasterKey }
+        { name: 'COSMOS_DATABASE_NAME', value: 'SpotifyStats' }
         { name: 'SPOTIFY_CLIENT_ID', value: spotifyClientId }
         { name: 'SPOTIFY_CLIENT_SECRET', value: spotifyClientSecret }
         { name: 'SESSION_SECRET', value: sessionSecret }

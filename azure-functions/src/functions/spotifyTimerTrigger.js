@@ -2,7 +2,7 @@ const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 const SpotifyWebApi = require('spotify-web-api-node');
 
-const cronExpression = '0 */3 * * * *';
+const cronExpression = '0 */10 * * * *';
 const cosmosEndpoint = process.env.COSMOS_ENDPOINT;
 const cosmosKey = process.env.COSMOS_KEY;
 const cosmosDatabaseName = process.env.COSMOS_DATABASE_NAME || 'SpotifyStats';
@@ -57,11 +57,17 @@ function decodeTokenBlob(rawValue) {
 function normalizeTokenDoc(doc) {
   if (!doc || typeof doc !== 'object') return null;
   const userId = String(doc.userId || spotifyUserId || 'default');
+<<<<<<< HEAD
   const accessToken = doc.accessToken || doc.access_token || doc.spotifyAccessToken || null;
   const refreshToken = doc.refreshToken || doc.refresh_token || doc.spotifyRefreshToken || null;
   const rawTokenExpires = doc.tokenExpires ?? doc.tokenExpiresAt ?? doc.expiresAt ?? doc.expires_at ?? 0;
   const normalizedTokenExpires = Number(rawTokenExpires);
   const tokenExpires = Number.isFinite(normalizedTokenExpires) ? normalizedTokenExpires : null;
+=======
+  const accessToken = doc.accessToken || doc.spotifyAccessToken || doc.access_token || null;
+  const refreshToken = doc.refreshToken || doc.spotifyRefreshToken || doc.refresh_token || null;
+  const tokenExpires = Number(doc.tokenExpires || doc.tokenExpiresAt || doc.expiresAt || doc.expires_at || 0) || null;
+>>>>>>> 581fbc9 (feat: cleanup Databases & added Spotify Token after login)
 
   if (!accessToken && !refreshToken) return null;
 
@@ -144,7 +150,11 @@ async function persistTokenDocIfNeeded(tokenDoc, context) {
 }
 
 async function refreshTokensIfNeeded(tokenDoc, spotifyApi, context) {
+<<<<<<< HEAD
   const needsRefresh = !tokenDoc.accessToken || !tokenDoc.tokenExpires || Date.now() > tokenDoc.tokenExpires - 120000;
+=======
+  const needsRefresh = !tokenDoc.accessToken || (tokenDoc.tokenExpires && Date.now() > tokenDoc.tokenExpires - 120000);
+>>>>>>> 581fbc9 (feat: cleanup Databases & added Spotify Token after login)
   if (!needsRefresh || !tokenDoc.refreshToken) return tokenDoc;
 
   const refreshed = await spotifyApi.refreshAccessToken();
@@ -157,7 +167,9 @@ async function refreshTokensIfNeeded(tokenDoc, spotifyApi, context) {
 
 function buildSpotifyApi(tokenDoc) {
   const api = new SpotifyWebApi(spotifyCredentials);
-  api.setAccessToken(tokenDoc.accessToken);
+  if (tokenDoc.accessToken) {
+    api.setAccessToken(tokenDoc.accessToken);
+  }
   if (tokenDoc.refreshToken) {
     api.setRefreshToken(tokenDoc.refreshToken);
   }
@@ -167,7 +179,11 @@ function buildSpotifyApi(tokenDoc) {
 async function syncRecentlyPlayedTracks(context) {
   const tokenDoc = await loadTokenDoc(context);
   if (!tokenDoc || (!tokenDoc.accessToken && !tokenDoc.refreshToken)) {
+<<<<<<< HEAD
     context.log('Spotify-Tracking übersprungen: Kein Zugriffstoken gefunden.');
+=======
+    context.log('Spotify-Tracking übersprungen: Keine Spotify-Tokens gefunden.');
+>>>>>>> 581fbc9 (feat: cleanup Databases & added Spotify Token after login)
     return;
   }
 
