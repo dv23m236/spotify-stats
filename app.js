@@ -174,13 +174,13 @@ function setCachedData(sessionId, type, key, data, ttlMs) {
   }
 }
 
-// ─── BACKGROUND LIVE-TRACKING (4H INTERVALL) ─────────────────────────────────
+// ─── BACKGROUND LIVE-TRACKING (10 MIN INTERVALL) ────────────────────────────
 // Token-Registry: userId -> { accessToken, refreshToken, tokenExpires }
 // Wird beim Login befüllt und beim Token-Refresh aktualisiert.
 // Kein Zugriff auf den Session-Store – kein Konflikt mit dem Login-Flow.
 const tokenRegistry = new Map();
 
-const STREAM_SYNC_INTERVAL_MS = 4 * 60 * 60 * 1000;
+const STREAM_SYNC_INTERVAL_MS = 10 * 60 * 1000;
 let streamSyncIsRunning = false;
 
 async function persistSpotifyTokenDocument(userId, tokenData, sourceLabel = 'app') {
@@ -286,9 +286,37 @@ async function syncStreamHistoryForUser(userId, entry) {
     });
   }
 
-  if (newStreams.length > 0) {
-    console.log(`--- [Cron] User ${userId}: ${newStreams.length} neue Streams gespeichert ---`);
+  console.log(`--- [Cron] User ${userId}: ${newStreams.length} neue Streams gespeichert (${items.length} geprüft) ---`);
+}
+
+async function hydrateTokenRegistryFromCosmos() {
+  if (!tokenContainer) {
+    await ensureCosmosInitialized();
   }
+  if (!tokenContainer) return 0;
+
+  const { resources } = await tokenContainer.items.query({
+    query: 'SELECT * FROM c'
+  }).fetchAll();
+
+  let loaded = 0;
+  for (const resource of resources || []) {
+    const userId = resource?.userId || resource?.id;
+    const accessToken = resource?.accessToken || resource?.access_token || null;
+    const refreshToken = resource?.refreshToken || resource?.refresh_token || null;
+    const tokenExpires = Number(resource?.tokenExpires ?? resource?.expires_at ?? resource?.expiresAt ?? 0) || null;
+    if (!userId || (!accessToken && !refreshToken)) continue;
+
+    tokenRegistry.set(String(userId), {
+      accessToken,
+      refreshToken,
+      tokenExpires
+    });
+    loaded += 1;
+  }
+
+  console.log(`--- [Cron] Token-Registry aus Cosmos geladen: ${loaded} User ---`);
+  return loaded;
 }
 
 async function runStreamHistorySyncJob() {
@@ -296,20 +324,33 @@ async function runStreamHistorySyncJob() {
     console.log('--- [Cron] StreamHistory-Sync übersprungen: Job läuft bereits ---');
     return;
   }
+
+  console.log(`--- [Cron] StreamHistory-Sync gestartet. Registry: ${tokenRegistry.size} User ---`);
+
   if (!streamHistoryContainer) {
-    console.log('--- [Cron] StreamHistory-Sync übersprungen: Cosmos DB nicht verbunden (lokaler Modus oder fehlende Env-Variablen) ---');
+    console.log('--- [Cron] StreamHistory-Sync übersprungen: StreamHistory-Container nicht verfügbar ---');
     return;
   }
   if (tokenRegistry.size === 0) {
-    console.log('--- [Cron] StreamHistory-Sync übersprungen: Keine eingeloggten User in der Registry ---');
-    return;
+    try {
+      const loaded = await hydrateTokenRegistryFromCosmos();
+      if (loaded === 0) {
+        console.log('--- [Cron] StreamHistory-Sync übersprungen: Keine Tokens in Cosmos gefunden ---');
+        return;
+      }
+    } catch (err) {
+      console.error('--- [Cron] Token-Registry konnte nicht aus Cosmos geladen werden:', err?.message || err);
+      return;
+    }
   }
 
   streamSyncIsRunning = true;
   try {
     for (const [userId, entry] of tokenRegistry.entries()) {
+      console.log(`--- [Cron] Sync für User ${userId} gestartet ---`);
       try {
         await syncStreamHistoryForUser(userId, entry);
+        console.log(`--- [Cron] Sync für User ${userId} abgeschlossen ---`);
       } catch (err) {
         console.error(`--- [Cron] Fehler für User ${userId}:`, err?.message || err);
       }
