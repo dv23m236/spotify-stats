@@ -10,13 +10,43 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 
 const app = Express();
 const port = process.env.PORT || 8000;
 
+const ZURICH_TIMEZONE = 'Europe/Zurich';
+
+function formatZurichTimestamp(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: ZURICH_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).formatToParts(date).reduce((acc, p) => {
+    if (p.type !== 'literal') acc[p.type] = p.value;
+    return acc;
+  }, {});
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
+function logWithTimezones(scope, message, level = 'info', err = null) {
+  const zurich = formatZurichTimestamp();
+  const prefix = `--- [${scope}] [Zurich ${zurich}] ${message} ---`;
+  if (level === 'error') {
+    if (err) console.error(prefix, err?.message || err);
+    else console.error(prefix);
+    return;
+  }
+  console.log(prefix);
+}
+
 // Prüft beim Start, ob die wichtigsten Variablen gesetzt sind.
 // So gibt's eine klare Fehlermeldung statt eines kryptischen Absturzes mitten im Betrieb.
 const requiredEnvVars = ['SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET', 'SESSION_SECRET'];
 const missingEnvVars = requiredEnvVars.filter(key => !process.env[key]);
 if (missingEnvVars.length > 0) {
-  console.error(`--- [Fehler] Fehlende Umgebungsvariablen: ${missingEnvVars.join(', ')} ---`);
-  console.error('--- Bitte eine .env-Datei anlegen (siehe .env.example) oder in den Azure App Settings setzen ---');
+  logWithTimezones('Fehler', `Fehlende Umgebungsvariablen: ${missingEnvVars.join(', ')}`, 'error');
+  logWithTimezones('Fehler', 'Bitte eine .env-Datei anlegen (siehe .env.example) oder in den Azure App Settings setzen', 'error');
   process.exit(1);
 }
 
@@ -135,10 +165,10 @@ async function ensureCosmosInitialized() {
         usersContainer = userContainer;
         streamHistoryContainer = streamContainer;
         tokenContainer = spotifyTokenContainer;
-        console.log(`--- [System] Cosmos DB erfolgreich initialisiert (DB: ${cosmosDatabaseName}) ---`);
+        logWithTimezones('System', `Cosmos DB erfolgreich initialisiert (DB: ${cosmosDatabaseName})`);
         return true;
       } catch (err) {
-        console.error('--- [Fehler] Cosmos DB Initialisierung fehlgeschlagen:', err);
+        logWithTimezones('Fehler', 'Cosmos DB Initialisierung fehlgeschlagen', 'error', err);
         return false;
       }
     })();
@@ -150,7 +180,7 @@ async function ensureCosmosInitialized() {
 if (cosmosClient) {
   ensureCosmosInitialized();
 } else {
-  console.log('--- [System] Lokaler Modus ohne Azure Cosmos DB (Variablen fehlen) ---');
+  logWithTimezones('System', 'Lokaler Modus ohne Azure Cosmos DB (Variablen fehlen)');
 }
 
 // ─── USER-SPEZIFISCHER CACHE ──────────────────────────────────────────────────
@@ -225,7 +255,7 @@ async function syncStreamHistoryForUser(userId, entry) {
     try {
       await persistSpotifyTokenDocument(userId, entry, 'app-cron-refresh');
     } catch (persistErr) {
-      console.error(`--- [Cron] Token-Persistenz fehlgeschlagen für User ${userId}:`, persistErr?.message || persistErr);
+      logWithTimezones('Cron', `Token-Persistenz fehlgeschlagen für User ${userId}`, 'error', persistErr);
     }
   }
 
@@ -245,7 +275,7 @@ async function syncStreamHistoryForUser(userId, entry) {
     try {
       await persistSpotifyTokenDocument(userId, entry, 'app-cron-retry-refresh');
     } catch (persistErr) {
-      console.error(`--- [Cron] Token-Persistenz (Retry) fehlgeschlagen für User ${userId}:`, persistErr?.message || persistErr);
+      logWithTimezones('Cron', `Token-Persistenz (Retry) fehlgeschlagen für User ${userId}`, 'error', persistErr);
     }
     recent = await userApi.getMyRecentlyPlayedTracks({ limit: 50 });
   }
@@ -286,7 +316,7 @@ async function syncStreamHistoryForUser(userId, entry) {
     });
   }
 
-  console.log(`--- [Cron] User ${userId}: ${newStreams.length} neue Streams gespeichert (${items.length} geprüft) ---`);
+  logWithTimezones('Cron', `User ${userId}: ${newStreams.length} neue Streams gespeichert (${items.length} geprüft)`);
 }
 
 async function hydrateTokenRegistryFromCosmos() {
@@ -315,31 +345,31 @@ async function hydrateTokenRegistryFromCosmos() {
     loaded += 1;
   }
 
-  console.log(`--- [Cron] Token-Registry aus Cosmos geladen: ${loaded} User ---`);
+  logWithTimezones('Cron', `Token-Registry aus Cosmos geladen: ${loaded} User`);
   return loaded;
 }
 
 async function runStreamHistorySyncJob() {
   if (streamSyncIsRunning) {
-    console.log('--- [Cron] StreamHistory-Sync übersprungen: Job läuft bereits ---');
+    logWithTimezones('Cron', 'StreamHistory-Sync übersprungen: Job läuft bereits');
     return;
   }
 
-  console.log(`--- [Cron] StreamHistory-Sync gestartet. Registry: ${tokenRegistry.size} User ---`);
+  logWithTimezones('Cron', `StreamHistory-Sync gestartet. Registry: ${tokenRegistry.size} User`);
 
   if (!streamHistoryContainer) {
-    console.log('--- [Cron] StreamHistory-Sync übersprungen: StreamHistory-Container nicht verfügbar ---');
+    logWithTimezones('Cron', 'StreamHistory-Sync übersprungen: StreamHistory-Container nicht verfügbar');
     return;
   }
   if (tokenRegistry.size === 0) {
     try {
       const loaded = await hydrateTokenRegistryFromCosmos();
       if (loaded === 0) {
-        console.log('--- [Cron] StreamHistory-Sync übersprungen: Keine Tokens in Cosmos gefunden ---');
+        logWithTimezones('Cron', 'StreamHistory-Sync übersprungen: Keine Tokens in Cosmos gefunden');
         return;
       }
     } catch (err) {
-      console.error('--- [Cron] Token-Registry konnte nicht aus Cosmos geladen werden:', err?.message || err);
+      logWithTimezones('Cron', 'Token-Registry konnte nicht aus Cosmos geladen werden', 'error', err);
       return;
     }
   }
@@ -347,12 +377,12 @@ async function runStreamHistorySyncJob() {
   streamSyncIsRunning = true;
   try {
     for (const [userId, entry] of tokenRegistry.entries()) {
-      console.log(`--- [Cron] Sync für User ${userId} gestartet ---`);
+      logWithTimezones('Cron', `Sync für User ${userId} gestartet`);
       try {
         await syncStreamHistoryForUser(userId, entry);
-        console.log(`--- [Cron] Sync für User ${userId} abgeschlossen ---`);
+        logWithTimezones('Cron', `Sync für User ${userId} abgeschlossen`);
       } catch (err) {
-        console.error(`--- [Cron] Fehler für User ${userId}:`, err?.message || err);
+        logWithTimezones('Cron', `Fehler für User ${userId}`, 'error', err);
       }
     }
   } finally {
@@ -438,13 +468,13 @@ app.get('/', (req, res) => {
               refreshToken: req.session.refreshToken,
               tokenExpires: req.session.tokenExpires
             }, 'app-login');
-            console.log(`--- [System] Spotify-Token in Cosmos gespeichert für User ${userId} ---`);
+            logWithTimezones('System', `Spotify-Token in Cosmos gespeichert für User ${userId}`);
           } catch (tokenPersistErr) {
-            console.error(`--- [System] Spotify-Token konnte nicht gespeichert werden für User ${userId}:`, tokenPersistErr?.message || tokenPersistErr);
+            logWithTimezones('System', `Spotify-Token konnte nicht gespeichert werden für User ${userId}`, 'error', tokenPersistErr);
           }
         }
       } catch (regErr) {
-        console.error('--- [System] Token-Registry-Eintrag fehlgeschlagen:', regErr.message);
+        logWithTimezones('System', 'Token-Registry-Eintrag fehlgeschlagen', 'error', regErr);
       }
 
       res.redirect('/stats');
@@ -479,13 +509,13 @@ async function checkAndRefreshUserToken(req, res, next) {
             tokenExpires: req.session.tokenExpires
           }, 'app-session-refresh');
         } catch (tokenPersistErr) {
-          console.error(`--- [System] Spotify-Token konnte nach Refresh nicht gespeichert werden (${req.session.spotifyUserId}):`, tokenPersistErr?.message || tokenPersistErr);
+          logWithTimezones('System', `Spotify-Token konnte nach Refresh nicht gespeichert werden (${req.session.spotifyUserId})`, 'error', tokenPersistErr);
         }
       }
 
-      console.log(`--- [System] Token für Session ${req.session.id} erneuert ---`);
+      logWithTimezones('System', `Token für Session ${req.session.id} erneuert`);
     } catch (err) {
-      console.error('Fehler beim automatischen User-Token-Refresh:', err.message);
+      logWithTimezones('System', 'Fehler beim automatischen User-Token-Refresh', 'error', err);
     }
   }
   next();
@@ -649,7 +679,7 @@ app.get('/api/stats/month', checkAndRefreshUserToken, async (req, res) => {
 
     return res.status(200).json({ source: 'cosmos', month, tracks });
   } catch (err) {
-    console.error('--- [API] /api/stats/month Fehler:', err?.message || err);
+    logWithTimezones('API', '/api/stats/month Fehler', 'error', err);
     return res.status(500).json({ error: 'Monatsauswertung konnte nicht geladen werden.' });
   }
 });
@@ -687,7 +717,7 @@ app.get('/api/highscores/me', checkAndRefreshUserToken, async (req, res) => {
       sliderHighscore: Number(sessionFallback.slider) || 0
     });
   } catch (err) {
-    console.error('--- [API] /api/highscores/me Fehler:', err?.message || err);
+    logWithTimezones('API', '/api/highscores/me Fehler', 'error', err);
     return res.json({
       quizHighscore: Number(sessionFallback.quiz) || 0,
       sliderHighscore: Number(sessionFallback.slider) || 0
@@ -739,7 +769,7 @@ app.post('/api/highscores', checkAndRefreshUserToken, Express.json(), async (req
       sliderHighscore: Number(savedDoc?.sliderHighscore) || 0
     });
   } catch (err) {
-    console.error('--- [API] /api/highscores Fehler:', err?.message || err);
+    logWithTimezones('API', '/api/highscores Fehler', 'error', err);
     if (scoreInt > (Number(req.session.highscores[game]) || 0)) {
       req.session.highscores[game] = scoreInt;
     }
@@ -2347,4 +2377,4 @@ app.post('/api/import/spotify', checkAndRefreshUserToken, upload.single('file'),
   });
 });
 
-app.listen(port, () => console.log(`Server läuft auf http://127.0.0.1:${port}`));
+app.listen(port, () => logWithTimezones('System', `Server läuft auf http://127.0.0.1:${port}`));
