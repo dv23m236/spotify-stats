@@ -115,6 +115,87 @@ function sanitizeLeaderboardDisplayName(name) {
   return normalized.slice(0, 64);
 }
 
+function needsLeaderboardDisplayNameBackfill(doc) {
+  const currentDisplayName = sanitizeLeaderboardDisplayName(doc?.displayName ?? '');
+  const userId = String(doc?.userId || doc?.id || '').trim();
+  return currentDisplayName === 'Spotify User' || (userId && currentDisplayName === userId);
+}
+
+async function resolveSpotifyDisplayNameForBackfill(userId, tokenEntry) {
+  const fallbackName = sanitizeLeaderboardDisplayName(userId);
+  if (!userId) return fallbackName;
+
+  const entry = tokenEntry || tokenRegistry.get(userId) || null;
+  if (!entry) return fallbackName;
+
+  const userApi = new SpotifyWebApi(spotifyCredentials);
+  if (entry.accessToken) userApi.setAccessToken(entry.accessToken);
+  if (entry.refreshToken) userApi.setRefreshToken(entry.refreshToken);
+
+  const tryGetMe = async () => {
+    const me = await userApi.getMe();
+    return sanitizeLeaderboardDisplayName(me?.body?.display_name || me?.body?.id || userId);
+  };
+
+  try {
+    return await tryGetMe();
+  } catch (err) {
+    const unauthorized = err?.statusCode === 401 || String(err?.message || '').includes('The access token expired');
+    if (!unauthorized || !entry.refreshToken) {
+      return fallbackName;
+    }
+
+    try {
+      const refreshed = await userApi.refreshAccessToken();
+      entry.accessToken = refreshed.body['access_token'] || entry.accessToken || null;
+      entry.refreshToken = refreshed.body['refresh_token'] || entry.refreshToken || null;
+      entry.tokenExpires = Date.now() + (Number(refreshed.body['expires_in']) || 3600) * 1000;
+      tokenRegistry.set(userId, entry);
+      try {
+        await persistSpotifyTokenDocument(userId, entry, 'app-backfill-refresh');
+      } catch (persistErr) {
+        logWithTimezones('Backfill', `Token konnte für User ${userId} nicht aktualisiert werden`, 'error', persistErr);
+      }
+      userApi.setAccessToken(entry.accessToken);
+      return await tryGetMe();
+    } catch (refreshErr) {
+      logWithTimezones('Backfill', `Spotify-Name konnte nicht für User ${userId} aufgelöst werden`, 'error', refreshErr);
+      return fallbackName;
+    }
+  }
+}
+
+async function backfillLeaderboardDisplayNames() {
+  if (!usersContainer) return { scanned: 0, updated: 0 };
+
+  const { resources: userDocs } = await usersContainer.items.query({
+    query: 'SELECT c.id, c.userId, c.displayName, c.quizHighscore, c.sliderHighscore FROM c'
+  }).fetchAll();
+
+  let scanned = 0;
+  let updated = 0;
+
+  for (const doc of userDocs || []) {
+    scanned += 1;
+    const userId = String(doc?.userId || doc?.id || '').trim();
+    if (!userId || !needsLeaderboardDisplayNameBackfill(doc)) continue;
+
+    const resolvedDisplayName = await resolveSpotifyDisplayNameForBackfill(userId, tokenRegistry.get(userId));
+    const currentDisplayName = sanitizeLeaderboardDisplayName(doc?.displayName);
+    if (!resolvedDisplayName || resolvedDisplayName === currentDisplayName) continue;
+
+    await upsertUserHighscoreDoc(userId, doc, {
+      displayName: resolvedDisplayName,
+      quizHighscore: Number(doc?.quizHighscore) || 0,
+      sliderHighscore: Number(doc?.sliderHighscore) || 0
+    });
+    updated += 1;
+  }
+
+  logWithTimezones('Backfill', `Leaderboard-DisplayNames geprüft: ${scanned}, aktualisiert: ${updated}`);
+  return { scanned, updated };
+}
+
 async function readUserHighscoreDoc(userId) {
   if (!usersContainer || !userId) return null;
   try {
@@ -189,7 +270,19 @@ async function ensureCosmosInitialized() {
 }
 
 if (cosmosClient) {
-  ensureCosmosInitialized();
+  ensureCosmosInitialized()
+    .then(async (ready) => {
+      if (!ready) return;
+      try {
+        await hydrateTokenRegistryFromCosmos();
+        await backfillLeaderboardDisplayNames();
+      } catch (err) {
+        logWithTimezones('Backfill', 'Leaderboard-Backfill fehlgeschlagen', 'error', err);
+      }
+    })
+    .catch((err) => {
+      logWithTimezones('Backfill', 'Cosmos-Initialisierung für Backfill fehlgeschlagen', 'error', err);
+    });
 } else {
   logWithTimezones('System', 'Lokaler Modus ohne Azure Cosmos DB (Variablen fehlen)');
 }
@@ -769,6 +862,15 @@ app.post('/api/highscores', checkAndRefreshUserToken, Express.json(), async (req
       });
     }
 
+    if (!req.session.spotifyDisplayName) {
+      try {
+        const me = await getUserSpotifyApi(req).getMe();
+        req.session.spotifyDisplayName = String(me?.body?.display_name || me?.body?.id || '').trim();
+      } catch (displayNameErr) {
+        logWithTimezones('API', 'DisplayName konnte für /api/highscores nicht geladen werden', 'error', displayNameErr);
+      }
+    }
+
     const currentDoc = await readUserHighscoreDoc(userId);
     const nextDoc = {
       displayName: sanitizeLeaderboardDisplayName(req.session.spotifyDisplayName),
@@ -799,9 +901,10 @@ app.get('/api/highscores/global', checkAndRefreshUserToken, async (req, res) => 
   }
 
   try {
-    if (!req.session.spotifyDisplayName) {
+    if (!req.session.spotifyDisplayName || !req.session.spotifyUserId) {
       try {
         const me = await getUserSpotifyApi(req).getMe();
+        req.session.spotifyUserId = req.session.spotifyUserId || String(me?.body?.id || '').trim();
         req.session.spotifyDisplayName = String(me?.body?.display_name || me?.body?.id || '').trim();
       } catch (displayNameErr) {
         logWithTimezones('API', 'DisplayName konnte für /api/highscores/global nicht geladen werden', 'error', displayNameErr);
@@ -809,13 +912,14 @@ app.get('/api/highscores/global', checkAndRefreshUserToken, async (req, res) => 
     }
 
     const currentDisplayName = sanitizeLeaderboardDisplayName(req.session.spotifyDisplayName);
+    const currentUserId = String(req.session.spotifyUserId || '').trim();
     const currentNameLower = currentDisplayName.toLowerCase();
 
     const quizQuery = {
-      query: 'SELECT TOP 20 c.displayName, c.quizHighscore FROM c WHERE IS_DEFINED(c.quizHighscore) ORDER BY c.quizHighscore DESC'
+      query: 'SELECT TOP 20 c.userId, c.displayName, c.quizHighscore FROM c WHERE IS_DEFINED(c.quizHighscore) ORDER BY c.quizHighscore DESC'
     };
     const sliderQuery = {
-      query: 'SELECT TOP 20 c.displayName, c.sliderHighscore FROM c WHERE IS_DEFINED(c.sliderHighscore) ORDER BY c.sliderHighscore DESC'
+      query: 'SELECT TOP 20 c.userId, c.displayName, c.sliderHighscore FROM c WHERE IS_DEFINED(c.sliderHighscore) ORDER BY c.sliderHighscore DESC'
     };
 
     const [quizRowsResult, sliderRowsResult] = await Promise.all([
@@ -824,24 +928,26 @@ app.get('/api/highscores/global', checkAndRefreshUserToken, async (req, res) => 
     ]);
 
     const quizTop20 = (quizRowsResult?.resources || []).map((row, index) => {
-      const displayName = sanitizeLeaderboardDisplayName(row.displayName);
+      const displayName = sanitizeLeaderboardDisplayName(row.displayName || row.userId);
+      const rowUserId = String(row.userId || '').trim();
       const score = Math.max(0, Math.floor(Number(row.quizHighscore) || 0));
       return {
         rank: index + 1,
         displayName,
         score,
-        isCurrentUser: displayName.toLowerCase() === currentNameLower
+        isCurrentUser: rowUserId ? rowUserId === currentUserId : displayName.toLowerCase() === currentNameLower
       };
     });
 
     const sliderTop20 = (sliderRowsResult?.resources || []).map((row, index) => {
-      const displayName = sanitizeLeaderboardDisplayName(row.displayName);
+      const displayName = sanitizeLeaderboardDisplayName(row.displayName || row.userId);
+      const rowUserId = String(row.userId || '').trim();
       const score = Math.max(0, Math.floor(Number(row.sliderHighscore) || 0));
       return {
         rank: index + 1,
         displayName,
         score,
-        isCurrentUser: displayName.toLowerCase() === currentNameLower
+        isCurrentUser: rowUserId ? rowUserId === currentUserId : displayName.toLowerCase() === currentNameLower
       };
     });
 
