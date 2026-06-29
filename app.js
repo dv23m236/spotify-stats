@@ -1,13 +1,23 @@
 require('dotenv').config(); // Lädt Variablen aus der .env-Datei (lokal) bzw. aus den Azure App Settings
 
 const Express = require('express');
+const http = require('http');
 const SpotifyWebApi = require('spotify-web-api-node');
 const { CosmosClient } = require('@azure/cosmos');
 const session = require('express-session');
+const { Server } = require('socket.io');
+const { randomUUID } = require('crypto');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 const app = Express();
+const httpServer = http.createServer(app);
+const io = new Server(httpServer, {
+  cors: {
+    origin: true,
+    credentials: true
+  }
+});
 const port = process.env.PORT || 8000;
 
 const ZURICH_TIMEZONE = 'Europe/Zurich';
@@ -53,7 +63,7 @@ if (missingEnvVars.length > 0) {
 app.set('trust proxy', 1);
 
 // 1. Express-Session konfigurieren
-app.use(session({
+const sessionMiddleware = session({
   secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
@@ -61,7 +71,12 @@ app.use(session({
     secure: !!process.env.WEBSITE_HOSTNAME, // Auf Azure (HTTPS) automatisch 'true', lokal 'false'
     maxAge: 3600000 // 1 Stunde Gültigkeit
   }
-}));
+});
+app.use(sessionMiddleware);
+
+io.use((socket, next) => {
+  sessionMiddleware(socket.request, {}, next);
+});
 
 // Verhindert, dass der Browser die API-Antworten im Cache speichert
 app.use((req, res, next) => {
@@ -316,6 +331,902 @@ const tokenRegistry = new Map();
 
 const STREAM_SYNC_INTERVAL_MS = 10 * 60 * 1000;
 let streamSyncIsRunning = false;
+
+const onlineUsers = new Map();
+const socketToUser = new Map();
+const pendingChallenges = new Map();
+const activeMatches = new Map();
+
+const ROUND_DURATION_MS = 22000;
+const CHALLENGE_TIMEOUT_MS = 30000;
+const MULTIPLAYER_ROUNDS = 5;
+const GLOBAL_TOP_50_PLAYLIST_ID = '37i9dQZEVXbMDoHDwVN2tF';
+
+let appAccessTokenCache = {
+  token: null,
+  expiresAt: 0
+};
+const duelPreviewFallbackCache = new Map();
+
+function toSafeDisplayName(value, fallbackUserId) {
+  const display = sanitizeLeaderboardDisplayName(value);
+  if (display && display !== 'Spotify User') return display;
+  return sanitizeLeaderboardDisplayName(fallbackUserId || 'Spotify User');
+}
+
+function getUserBusyReason(userId, ignoreChallengeId = null) {
+  for (const match of activeMatches.values()) {
+    if (match?.status === 'active' && match.players.includes(userId)) {
+      return 'match';
+    }
+  }
+
+  for (const challenge of pendingChallenges.values()) {
+    if (ignoreChallengeId && challenge.challengeId === ignoreChallengeId) continue;
+    if (challenge.expiresAt <= Date.now()) continue;
+    if (challenge.fromUserId === userId || challenge.toUserId === userId) {
+      return 'challenge';
+    }
+  }
+
+  return null;
+}
+
+function getOnlineUserRecord(userId) {
+  if (!userId) return null;
+  return onlineUsers.get(userId) || null;
+}
+
+function registerSocketPresence(socket, userId, displayName) {
+  const normalizedUserId = String(userId || '').trim();
+  if (!normalizedUserId) return null;
+
+  const existing = onlineUsers.get(normalizedUserId) || {
+    userId: normalizedUserId,
+    displayName: toSafeDisplayName(displayName, normalizedUserId),
+    sockets: new Set(),
+    lastSeenAt: Date.now()
+  };
+
+  existing.displayName = toSafeDisplayName(displayName || existing.displayName, normalizedUserId);
+  existing.sockets.add(socket.id);
+  existing.lastSeenAt = Date.now();
+  onlineUsers.set(normalizedUserId, existing);
+  socketToUser.set(socket.id, normalizedUserId);
+  socket.join(`user:${normalizedUserId}`);
+  return existing;
+}
+
+function removeSocketPresence(socket) {
+  const userId = socketToUser.get(socket.id);
+  if (!userId) return null;
+
+  const existing = onlineUsers.get(userId);
+  if (existing) {
+    existing.sockets.delete(socket.id);
+    existing.lastSeenAt = Date.now();
+    if (existing.sockets.size === 0) {
+      onlineUsers.delete(userId);
+      handleUserDisconnectedFromActiveMatch(userId, 'disconnect');
+    } else {
+      onlineUsers.set(userId, existing);
+    }
+  }
+
+  socketToUser.delete(socket.id);
+  return userId;
+}
+
+function getPresencePayload() {
+  return Array.from(onlineUsers.values())
+    .map((entry) => {
+      const busyReason = getUserBusyReason(entry.userId);
+      return {
+        userId: entry.userId,
+        displayName: entry.displayName,
+        status: busyReason ? 'busy' : 'available',
+        busyReason: busyReason || null
+      };
+    })
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
+}
+
+function broadcastPresence() {
+  io.emit('duel:presence', { users: getPresencePayload() });
+}
+
+async function ensureAppAccessToken() {
+  if (appAccessTokenCache.token && Date.now() < appAccessTokenCache.expiresAt - 30000) {
+    return appAccessTokenCache.token;
+  }
+
+  const grant = await spotifyApiFactory.clientCredentialsGrant();
+  const token = grant?.body?.access_token || null;
+  const expiresIn = Number(grant?.body?.expires_in || 3600);
+  if (!token) throw new Error('Spotify App Access Token konnte nicht geladen werden.');
+
+  appAccessTokenCache = {
+    token,
+    expiresAt: Date.now() + (expiresIn * 1000)
+  };
+  return token;
+}
+
+async function getUserTopTracksForDuel(userId) {
+  const tokenEntry = tokenRegistry.get(userId);
+  if (!tokenEntry || !tokenEntry.accessToken) return [];
+
+  const userApi = new SpotifyWebApi(spotifyCredentials);
+  userApi.setAccessToken(tokenEntry.accessToken);
+  if (tokenEntry.refreshToken) {
+    userApi.setRefreshToken(tokenEntry.refreshToken);
+  }
+
+  const withRetry = async (fn) => {
+    try {
+      return await fn();
+    } catch (err) {
+      const unauthorized = err?.statusCode === 401 || String(err?.message || '').includes('The access token expired');
+      if (!unauthorized || !tokenEntry.refreshToken) throw err;
+
+      const refreshed = await userApi.refreshAccessToken();
+      tokenEntry.accessToken = refreshed.body['access_token'] || tokenEntry.accessToken;
+      tokenEntry.refreshToken = refreshed.body['refresh_token'] || tokenEntry.refreshToken;
+      tokenEntry.tokenExpires = Date.now() + (Number(refreshed.body['expires_in']) || 3600) * 1000;
+      tokenRegistry.set(userId, tokenEntry);
+      userApi.setAccessToken(tokenEntry.accessToken);
+      try {
+        await persistSpotifyTokenDocument(userId, tokenEntry, 'app-duel-refresh');
+      } catch (persistErr) {
+        logWithTimezones('Duel', `Token-Persistenz fehlgeschlagen für ${userId}`, 'error', persistErr);
+      }
+      return await fn();
+    }
+  };
+
+  try {
+    const [shortTerm, mediumTerm] = await Promise.all([
+      withRetry(() => userApi.getMyTopTracks({ limit: 20, time_range: 'short_term' })),
+      withRetry(() => userApi.getMyTopTracks({ limit: 20, time_range: 'medium_term' }))
+    ]);
+    const items = [
+      ...(shortTerm?.body?.items || []),
+      ...(mediumTerm?.body?.items || [])
+    ];
+    return items;
+  } catch (err) {
+    logWithTimezones('Duel', `Top-Tracks konnten nicht geladen werden für ${userId}`, 'error', err);
+    return [];
+  }
+}
+
+async function getUserRecentlyPlayedForDuel(userId) {
+  const tokenEntry = tokenRegistry.get(userId);
+  if (!tokenEntry || !tokenEntry.accessToken) return [];
+
+  const userApi = new SpotifyWebApi(spotifyCredentials);
+  userApi.setAccessToken(tokenEntry.accessToken);
+  if (tokenEntry.refreshToken) {
+    userApi.setRefreshToken(tokenEntry.refreshToken);
+  }
+
+  const withRetry = async (fn) => {
+    try {
+      return await fn();
+    } catch (err) {
+      const unauthorized = err?.statusCode === 401 || String(err?.message || '').includes('The access token expired');
+      if (!unauthorized || !tokenEntry.refreshToken) throw err;
+
+      const refreshed = await userApi.refreshAccessToken();
+      tokenEntry.accessToken = refreshed.body['access_token'] || tokenEntry.accessToken;
+      tokenEntry.refreshToken = refreshed.body['refresh_token'] || tokenEntry.refreshToken;
+      tokenEntry.tokenExpires = Date.now() + (Number(refreshed.body['expires_in']) || 3600) * 1000;
+      tokenRegistry.set(userId, tokenEntry);
+      userApi.setAccessToken(tokenEntry.accessToken);
+      try {
+        await persistSpotifyTokenDocument(userId, tokenEntry, 'app-duel-recent-refresh');
+      } catch (persistErr) {
+        logWithTimezones('Duel', `Recent-Token-Persistenz fehlgeschlagen für ${userId}`, 'error', persistErr);
+      }
+
+      return await fn();
+    }
+  };
+
+  try {
+    const recent = await withRetry(() => userApi.getMyRecentlyPlayedTracks({ limit: 50 }));
+    return (recent?.body?.items || []).map((row) => row?.track).filter(Boolean);
+  } catch (err) {
+    logWithTimezones('Duel', `Recently played konnten nicht geladen werden für ${userId}`, 'error', err);
+    return [];
+  }
+}
+
+async function getGlobalTopTracksForDuel() {
+  try {
+    const token = await ensureAppAccessToken();
+    const appApi = new SpotifyWebApi(spotifyCredentials);
+    appApi.setAccessToken(token);
+
+    const tryFetch = async (options) => {
+      const data = await appApi.getPlaylistTracks(GLOBAL_TOP_50_PLAYLIST_ID, options);
+      return (data?.body?.items || []).map((row) => row?.track).filter(Boolean);
+    };
+
+    const attempts = [
+      { limit: 50 },
+      { limit: 50, market: 'CH' },
+      { limit: 50, market: 'US' }
+    ];
+
+    for (const options of attempts) {
+      try {
+        const tracks = await tryFetch(options);
+        if (tracks.length > 0) return tracks;
+      } catch (err) {
+        const statusCode = Number(err?.statusCode || 0);
+        const isForbidden = statusCode === 401 || statusCode === 403;
+        if (!isForbidden) {
+          throw err;
+        }
+      }
+    }
+
+    logWithTimezones('Duel', 'Globale Top-50 lokal nicht verfügbar (Spotify 401/403), verwende nur Spielerpools');
+    return [];
+  } catch (err) {
+    logWithTimezones('Duel', 'Globale Top-50 konnten nicht geladen werden, verwende nur Spielerpools', 'error', err);
+    return [];
+  }
+}
+
+function toQuestionTrack(track) {
+  if (!track || !track.id || !track.name) return null;
+  const firstArtist = Array.isArray(track.artists) && track.artists[0] ? track.artists[0].name : 'Unbekannt';
+  const image = track.album?.images?.[0]?.url || 'https://via.placeholder.com/300';
+  return {
+    trackId: String(track.id),
+    title: String(track.name),
+    artist: String(firstArtist),
+    image,
+    previewUrl: track.preview_url || track.previewUrl || null
+  };
+}
+
+function normalizeTrackNameForMatch(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+async function findPreviewFallbackForTrack(track) {
+  const trackId = String(track?.id || '').trim();
+  if (!trackId) return null;
+  if (duelPreviewFallbackCache.has(trackId)) {
+    return duelPreviewFallbackCache.get(trackId);
+  }
+
+  const title = String(track?.name || '').trim();
+  const artist = String(track?.artists?.[0]?.name || '').trim();
+  if (!title) {
+    duelPreviewFallbackCache.set(trackId, null);
+    return null;
+  }
+
+  const query = encodeURIComponent(`${title} ${artist}`.trim());
+  const requestUrl = `https://itunes.apple.com/search?term=${query}&entity=song&limit=8`;
+
+  try {
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), 2800);
+    const response = await fetch(requestUrl, { signal: controller.signal });
+    clearTimeout(timeoutHandle);
+
+    if (!response.ok) {
+      duelPreviewFallbackCache.set(trackId, null);
+      return null;
+    }
+
+    const payload = await response.json();
+    const results = Array.isArray(payload?.results) ? payload.results : [];
+    const normalizedTarget = normalizeTrackNameForMatch(title);
+
+    let preview = null;
+    for (const row of results) {
+      const candidatePreview = String(row?.previewUrl || '').trim();
+      if (!candidatePreview) continue;
+
+      const candidateTrackName = normalizeTrackNameForMatch(row?.trackName || '');
+      if (candidateTrackName && normalizedTarget && (candidateTrackName.includes(normalizedTarget) || normalizedTarget.includes(candidateTrackName))) {
+        preview = candidatePreview;
+        break;
+      }
+
+      if (!preview) {
+        preview = candidatePreview;
+      }
+    }
+
+    duelPreviewFallbackCache.set(trackId, preview || null);
+    return preview || null;
+  } catch (err) {
+    duelPreviewFallbackCache.set(trackId, null);
+    return null;
+  }
+}
+
+async function enrichDuelCandidatesWithPreviewFallback(candidates, maxLookups = 30) {
+  const pending = [];
+  const seen = new Set();
+
+  for (const track of candidates || []) {
+    const trackId = String(track?.id || '').trim();
+    if (!trackId || seen.has(trackId)) continue;
+    seen.add(trackId);
+
+    const existingPreview = String(track?.preview_url || track?.previewUrl || '').trim();
+    if (existingPreview) continue;
+
+    pending.push(track);
+    if (pending.length >= maxLookups) break;
+  }
+
+  await Promise.all(pending.map(async (track) => {
+    const fallbackPreview = await findPreviewFallbackForTrack(track);
+    if (!fallbackPreview) return;
+    track.preview_url = fallbackPreview;
+    track.previewUrl = fallbackPreview;
+  }));
+}
+
+function shuffleArray(values) {
+  const arr = [...values];
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function buildDuelQuestions(candidates, count) {
+  const trackMap = new Map();
+  for (const item of candidates) {
+    const normalized = toQuestionTrack(item);
+    if (!normalized) continue;
+    if (!trackMap.has(normalized.trackId)) {
+      trackMap.set(normalized.trackId, normalized);
+    }
+  }
+
+  const uniqueTracks = shuffleArray(Array.from(trackMap.values()));
+  if (uniqueTracks.length < 4) {
+    return [];
+  }
+
+  const withPreview = uniqueTracks.filter((track) => !!track.previewUrl);
+  const withoutPreview = uniqueTracks.filter((track) => !track.previewUrl);
+  const orderedTracks = [...shuffleArray(withPreview), ...shuffleArray(withoutPreview)];
+
+  const selected = [];
+  const targetCount = Math.max(count, MULTIPLAYER_ROUNDS);
+  while (selected.length < targetCount) {
+    selected.push(orderedTracks[selected.length % orderedTracks.length]);
+  }
+
+  const questions = [];
+
+  for (const correctTrack of selected) {
+    const wrongPool = shuffleArray(uniqueTracks.filter((t) => t.trackId !== correctTrack.trackId));
+    const wrongOptions = wrongPool.slice(0, 3);
+    if (wrongOptions.length < 3) continue;
+
+    const answerOptions = shuffleArray([
+      { trackId: correctTrack.trackId, title: correctTrack.title, isCorrect: true },
+      ...wrongOptions.map((opt) => ({ trackId: opt.trackId, title: opt.title, isCorrect: false }))
+    ]);
+
+    questions.push({
+      questionId: randomUUID(),
+      correctTrackId: correctTrack.trackId,
+      prompt: {
+        title: correctTrack.title,
+        artist: correctTrack.artist,
+        image: correctTrack.image,
+        previewUrl: correctTrack.previewUrl
+      },
+      options: answerOptions.map((opt) => ({ trackId: opt.trackId, title: opt.title }))
+    });
+
+    if (questions.length >= count) break;
+  }
+
+  return questions;
+}
+
+function clearChallenge(challengeId) {
+  const challenge = pendingChallenges.get(challengeId);
+  if (!challenge) return;
+  if (challenge.timeoutHandle) clearTimeout(challenge.timeoutHandle);
+  pendingChallenges.delete(challengeId);
+}
+
+function clearRoundTimer(match) {
+  if (match?.roundTimer) {
+    clearTimeout(match.roundTimer);
+    match.roundTimer = null;
+  }
+}
+
+function getMatchByPlayer(userId) {
+  for (const match of activeMatches.values()) {
+    if (match?.status === 'active' && match.players.includes(userId)) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function emitToUsers(userIds, eventName, payload) {
+  for (const userId of userIds) {
+    io.to(`user:${userId}`).emit(eventName, payload);
+  }
+}
+
+function calculateRoundPoints(answeredAtMs, roundEndsAtMs) {
+  const remainingMs = Math.max(0, roundEndsAtMs - answeredAtMs);
+  const normalized = remainingMs / ROUND_DURATION_MS;
+  const points = Math.max(10, Math.round(normalized * 100));
+  return { points, remainingMs };
+}
+
+function finalizeMatch(match, reason = 'finished', winnerUserId = null) {
+  if (!match) return;
+
+  clearRoundTimer(match);
+  match.status = 'finished';
+  activeMatches.delete(match.id);
+
+  const payload = {
+    matchId: match.id,
+    reason,
+    winnerUserId,
+    scores: match.scores,
+    players: match.players.map((userId) => ({
+      userId,
+      displayName: match.playerDisplayNames[userId] || userId
+    })),
+    roundsPlayed: match.currentRoundIndex
+  };
+
+  emitToUsers(match.players, 'duel:game-over', payload);
+  broadcastPresence();
+}
+
+function handleUserDisconnectedFromActiveMatch(userId, reason) {
+  const match = getMatchByPlayer(userId);
+  if (!match) return;
+  const opponent = match.players.find((id) => id !== userId) || null;
+  finalizeMatch(match, reason || 'disconnect', opponent);
+}
+
+function advanceMatchRound(matchId) {
+  const match = activeMatches.get(matchId);
+  if (!match || match.status !== 'active') return;
+
+  clearRoundTimer(match);
+  match.currentRoundIndex += 1;
+
+  if (match.currentRoundIndex >= match.questions.length) {
+    const [playerA, playerB] = match.players;
+    const scoreA = Number(match.scores[playerA] || 0);
+    const scoreB = Number(match.scores[playerB] || 0);
+    let winner = null;
+    if (scoreA > scoreB) winner = playerA;
+    else if (scoreB > scoreA) winner = playerB;
+    finalizeMatch(match, 'finished', winner);
+    return;
+  }
+
+  const question = match.questions[match.currentRoundIndex];
+  const startedAt = Date.now();
+  const endsAt = startedAt + ROUND_DURATION_MS;
+
+  match.roundState = {
+    startedAt,
+    endsAt,
+    questionId: question.questionId,
+    answers: {}
+  };
+
+  emitToUsers(match.players, 'duel:question', {
+    matchId: match.id,
+    roundIndex: match.currentRoundIndex,
+    totalRounds: match.questions.length,
+    roundDurationMs: ROUND_DURATION_MS,
+    endsAt,
+    prompt: question.prompt,
+    options: question.options
+  });
+
+  match.roundTimer = setTimeout(() => {
+    resolveRound(match.id, 'timeout');
+  }, ROUND_DURATION_MS + 50);
+}
+
+function resolveRound(matchId, reason) {
+  const match = activeMatches.get(matchId);
+  if (!match || match.status !== 'active' || !match.roundState) return;
+
+  clearRoundTimer(match);
+  const question = match.questions[match.currentRoundIndex];
+  if (!question) {
+    finalizeMatch(match, 'error', null);
+    return;
+  }
+
+  const answers = {};
+  for (const playerId of match.players) {
+    const response = match.roundState.answers[playerId] || null;
+    const isCorrect = response ? response.selectedTrackId === question.correctTrackId : false;
+    const points = isCorrect && response ? response.points : 0;
+    if (points > 0) {
+      match.scores[playerId] = Number(match.scores[playerId] || 0) + points;
+    }
+    answers[playerId] = {
+      selectedTrackId: response?.selectedTrackId || null,
+      answeredAt: response?.answeredAt || null,
+      isCorrect,
+      points,
+      remainingMs: response?.remainingMs || 0
+    };
+  }
+
+  emitToUsers(match.players, 'duel:round-result', {
+    matchId: match.id,
+    roundIndex: match.currentRoundIndex,
+    reason,
+    correctTrackId: question.correctTrackId,
+    answers,
+    scores: match.scores
+  });
+
+  match.roundState = null;
+  setTimeout(() => {
+    advanceMatchRound(match.id);
+  }, 1300);
+}
+
+async function buildMatchQuestionsForPlayers(playerA, playerB) {
+  const [aTopTracks, bTopTracks, aRecentTracks, bRecentTracks, globalTracks] = await Promise.all([
+    getUserTopTracksForDuel(playerA),
+    getUserTopTracksForDuel(playerB),
+    getUserRecentlyPlayedForDuel(playerA),
+    getUserRecentlyPlayedForDuel(playerB),
+    getGlobalTopTracksForDuel()
+  ]);
+
+  const combinedCandidates = [
+    ...aTopTracks,
+    ...bTopTracks,
+    ...aRecentTracks,
+    ...bRecentTracks,
+    ...globalTracks
+  ];
+
+  await enrichDuelCandidatesWithPreviewFallback(combinedCandidates, 40);
+
+  const questions = buildDuelQuestions(combinedCandidates, MULTIPLAYER_ROUNDS);
+
+  return questions;
+}
+
+function wireRealtimeHandlers() {
+  io.on('connection', (socket) => {
+    const reqSession = socket.request?.session || null;
+    const userId = String(reqSession?.spotifyUserId || '').trim();
+    const displayName = toSafeDisplayName(reqSession?.spotifyDisplayName, userId);
+
+    if (!userId) {
+      socket.emit('duel:error', { message: 'Keine gültige Session für Multiplayer gefunden.' });
+      socket.disconnect(true);
+      return;
+    }
+
+    registerSocketPresence(socket, userId, displayName);
+    broadcastPresence();
+
+    socket.emit('duel:hello', {
+      userId,
+      displayName,
+      challengeTimeoutMs: CHALLENGE_TIMEOUT_MS,
+      roundDurationMs: ROUND_DURATION_MS,
+      rounds: MULTIPLAYER_ROUNDS
+    });
+
+    socket.on('duel:challenge-user', ({ targetUserId }) => {
+      const targetId = String(targetUserId || '').trim();
+      const sourceId = socketToUser.get(socket.id);
+
+      if (!sourceId || !targetId) {
+        socket.emit('duel:error', { message: 'Ungültige Challenge-Daten.' });
+        return;
+      }
+      if (sourceId === targetId) {
+        socket.emit('duel:error', { message: 'Du kannst dich nicht selbst herausfordern.' });
+        return;
+      }
+
+      const sourceOnline = getOnlineUserRecord(sourceId);
+      const targetOnline = getOnlineUserRecord(targetId);
+      if (!sourceOnline || !targetOnline) {
+        socket.emit('duel:error', { message: 'Der Zielspieler ist nicht online.' });
+        return;
+      }
+
+      const sourceBusy = getUserBusyReason(sourceId);
+      const targetBusy = getUserBusyReason(targetId);
+      if (sourceBusy || targetBusy) {
+        socket.emit('duel:user-busy', {
+          targetUserId: targetId,
+          reason: targetBusy || sourceBusy
+        });
+        return;
+      }
+
+      const challengeId = randomUUID();
+      const expiresAt = Date.now() + CHALLENGE_TIMEOUT_MS;
+      const challengePayload = {
+        challengeId,
+        fromUserId: sourceId,
+        toUserId: targetId,
+        createdAt: Date.now(),
+        expiresAt,
+        timeoutHandle: null
+      };
+
+      const timeoutHandle = setTimeout(() => {
+        const stale = pendingChallenges.get(challengeId);
+        if (!stale) return;
+        pendingChallenges.delete(challengeId);
+        emitToUsers([stale.fromUserId, stale.toUserId], 'duel:challenge-expired', {
+          challengeId,
+          fromUserId: stale.fromUserId,
+          toUserId: stale.toUserId,
+          reason: 'expired'
+        });
+        broadcastPresence();
+      }, CHALLENGE_TIMEOUT_MS + 100);
+
+      challengePayload.timeoutHandle = timeoutHandle;
+      pendingChallenges.set(challengeId, challengePayload);
+
+      io.to(`user:${targetId}`).emit('duel:incoming-challenge', {
+        challengeId,
+        fromUserId: sourceId,
+        fromDisplayName: sourceOnline.displayName,
+        expiresAt
+      });
+
+      io.to(`user:${sourceId}`).emit('duel:challenge-sent', {
+        challengeId,
+        toUserId: targetId,
+        toDisplayName: targetOnline.displayName,
+        expiresAt
+      });
+
+      broadcastPresence();
+    });
+
+    socket.on('duel:challenge-accept', async ({ challengeId }) => {
+      const challenge = pendingChallenges.get(String(challengeId || ''));
+      const accepterId = socketToUser.get(socket.id);
+
+      if (!challenge || !accepterId || challenge.toUserId !== accepterId) {
+        socket.emit('duel:challenge-expired', {
+          challengeId: String(challengeId || ''),
+          reason: 'unavailable'
+        });
+        return;
+      }
+
+      if (challenge.expiresAt <= Date.now()) {
+        clearChallenge(challenge.challengeId);
+        emitToUsers([challenge.fromUserId, challenge.toUserId], 'duel:challenge-expired', {
+          challengeId: challenge.challengeId,
+          fromUserId: challenge.fromUserId,
+          toUserId: challenge.toUserId,
+          reason: 'expired'
+        });
+        broadcastPresence();
+        return;
+      }
+
+      const challengerBusy = getUserBusyReason(challenge.fromUserId, challenge.challengeId);
+      const accepterBusy = getUserBusyReason(challenge.toUserId, challenge.challengeId);
+      if (challengerBusy || accepterBusy) {
+        clearChallenge(challenge.challengeId);
+        emitToUsers([challenge.fromUserId, challenge.toUserId], 'duel:user-busy', {
+          targetUserId: challengerBusy ? challenge.fromUserId : challenge.toUserId,
+          reason: challengerBusy || accepterBusy
+        });
+        broadcastPresence();
+        return;
+      }
+
+      clearChallenge(challenge.challengeId);
+
+      try {
+        const questions = await buildMatchQuestionsForPlayers(challenge.fromUserId, challenge.toUserId);
+        if (!questions || questions.length < MULTIPLAYER_ROUNDS) {
+          emitToUsers([challenge.fromUserId, challenge.toUserId], 'duel:error', {
+            message: 'Nicht genug Song-Vorschauen für ein Duell verfügbar. Bitte später erneut versuchen.'
+          });
+          broadcastPresence();
+          return;
+        }
+
+        const fromRecord = getOnlineUserRecord(challenge.fromUserId);
+        const toRecord = getOnlineUserRecord(challenge.toUserId);
+        const matchId = randomUUID();
+        const match = {
+          id: matchId,
+          roomId: `duel:${matchId}`,
+          players: [challenge.fromUserId, challenge.toUserId],
+          playerDisplayNames: {
+            [challenge.fromUserId]: fromRecord?.displayName || challenge.fromUserId,
+            [challenge.toUserId]: toRecord?.displayName || challenge.toUserId
+          },
+          questions,
+          scores: {
+            [challenge.fromUserId]: 0,
+            [challenge.toUserId]: 0
+          },
+          currentRoundIndex: -1,
+          roundState: null,
+          roundTimer: null,
+          status: 'active',
+          createdAt: Date.now()
+        };
+
+        activeMatches.set(matchId, match);
+
+        emitToUsers(match.players, 'duel:challenge-accepted', {
+          challengeId: challenge.challengeId,
+          matchId,
+          players: match.players.map((playerId) => ({
+            userId: playerId,
+            displayName: match.playerDisplayNames[playerId]
+          }))
+        });
+
+        emitToUsers(match.players, 'duel:match-start', {
+          matchId,
+          players: match.players.map((playerId) => ({
+            userId: playerId,
+            displayName: match.playerDisplayNames[playerId]
+          })),
+          totalRounds: match.questions.length,
+          roundDurationMs: ROUND_DURATION_MS
+        });
+
+        broadcastPresence();
+        advanceMatchRound(match.id);
+      } catch (err) {
+        logWithTimezones('Duel', 'Match konnte nicht gestartet werden', 'error', err);
+        emitToUsers([challenge.fromUserId, challenge.toUserId], 'duel:error', {
+          message: 'Match konnte nicht gestartet werden. Bitte erneut versuchen.'
+        });
+        broadcastPresence();
+      }
+    });
+
+    socket.on('duel:challenge-reject', ({ challengeId }) => {
+      const challenge = pendingChallenges.get(String(challengeId || ''));
+      const rejectorId = socketToUser.get(socket.id);
+      if (!challenge || !rejectorId || challenge.toUserId !== rejectorId) {
+        socket.emit('duel:error', { message: 'Challenge konnte nicht abgelehnt werden.' });
+        return;
+      }
+
+      clearChallenge(challenge.challengeId);
+      emitToUsers([challenge.fromUserId, challenge.toUserId], 'duel:challenge-rejected', {
+        challengeId: challenge.challengeId,
+        fromUserId: challenge.fromUserId,
+        toUserId: challenge.toUserId
+      });
+      broadcastPresence();
+    });
+
+    socket.on('duel:challenge-cancel', ({ challengeId }) => {
+      const challenge = pendingChallenges.get(String(challengeId || ''));
+      const sourceId = socketToUser.get(socket.id);
+      if (!challenge || !sourceId || challenge.fromUserId !== sourceId) {
+        socket.emit('duel:challenge-expired', {
+          challengeId: String(challengeId || ''),
+          reason: 'unavailable'
+        });
+        return;
+      }
+
+      clearChallenge(challenge.challengeId);
+      emitToUsers([challenge.fromUserId, challenge.toUserId], 'duel:challenge-cancelled', {
+        challengeId: challenge.challengeId,
+        fromUserId: challenge.fromUserId,
+        toUserId: challenge.toUserId,
+        reason: 'cancelled'
+      });
+      broadcastPresence();
+    });
+
+    socket.on('duel:answer', ({ matchId, roundIndex, selectedTrackId }) => {
+      const match = activeMatches.get(String(matchId || ''));
+      const playerId = socketToUser.get(socket.id);
+      if (!match || !playerId || !match.players.includes(playerId) || match.status !== 'active') {
+        socket.emit('duel:error', { message: 'Antwort konnte nicht verarbeitet werden.' });
+        return;
+      }
+
+      if (!match.roundState || match.currentRoundIndex !== Number(roundIndex)) {
+        socket.emit('duel:error', { message: 'Runde ist nicht mehr aktiv.' });
+        return;
+      }
+
+      if (match.roundState.answers[playerId]) {
+        return;
+      }
+
+      const selectedId = String(selectedTrackId || '').trim();
+      if (!selectedId) {
+        socket.emit('duel:error', { message: 'Ungültige Antwort.' });
+        return;
+      }
+
+      const answeredAt = Date.now();
+      const pointsInfo = calculateRoundPoints(answeredAt, match.roundState.endsAt);
+      match.roundState.answers[playerId] = {
+        selectedTrackId: selectedId,
+        answeredAt,
+        points: pointsInfo.points,
+        remainingMs: pointsInfo.remainingMs
+      };
+
+      emitToUsers(match.players, 'duel:player-answered', {
+        matchId: match.id,
+        roundIndex: match.currentRoundIndex,
+        userId: playerId
+      });
+
+      const allAnswered = match.players.every((id) => !!match.roundState.answers[id]);
+      if (allAnswered) {
+        resolveRound(match.id, 'all_answered');
+      }
+    });
+
+    socket.on('disconnect', () => {
+      const removedUserId = removeSocketPresence(socket);
+      if (!removedUserId) return;
+
+      for (const [challengeId, challenge] of pendingChallenges.entries()) {
+        if (challenge.fromUserId === removedUserId || challenge.toUserId === removedUserId) {
+          clearChallenge(challengeId);
+          emitToUsers([challenge.fromUserId, challenge.toUserId], 'duel:challenge-expired', {
+            challengeId,
+            fromUserId: challenge.fromUserId,
+            toUserId: challenge.toUserId,
+            reason: 'disconnect'
+          });
+        }
+      }
+
+      broadcastPresence();
+    });
+  });
+}
+
+wireRealtimeHandlers();
 
 async function persistSpotifyTokenDocument(userId, tokenData, sourceLabel = 'app') {
   if (!userId || !tokenData) return;
@@ -1188,6 +2099,180 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           .games-stage { max-width:720px; margin:0 auto; }
           #game-arena { display:flex; justify-content:center; }
           .games-hint { text-align:center; color:#b3b3b3; margin:0; }
+          .duel-lobby-card {
+            background:rgba(255,255,255,0.03);
+            border:1px solid rgba(255,255,255,0.08);
+            border-radius:16px;
+            padding:16px;
+            margin-bottom:16px;
+            box-shadow:0 12px 28px rgba(0,0,0,0.28);
+          }
+          .duel-lobby-head { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+          .duel-lobby-title { margin:0; font-size:15px; font-weight:700; display:flex; align-items:center; gap:8px; }
+          .duel-status-chip {
+            display:inline-flex;
+            align-items:center;
+            gap:6px;
+            border-radius:999px;
+            padding:5px 10px;
+            font-size:11px;
+            font-weight:700;
+            border:1px solid rgba(255,255,255,0.15);
+            color:#d8d8d8;
+            background:rgba(255,255,255,0.04);
+          }
+          .duel-users-list { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:10px; }
+          .duel-user-item {
+            border:1px solid rgba(255,255,255,0.08);
+            border-radius:12px;
+            padding:10px;
+            background:rgba(255,255,255,0.02);
+            display:flex;
+            flex-direction:column;
+            gap:8px;
+          }
+          .duel-user-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+          .duel-user-name { font-weight:600; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+          .duel-user-badge {
+            font-size:10px;
+            letter-spacing:0.4px;
+            font-weight:700;
+            border-radius:999px;
+            padding:4px 8px;
+            text-transform:uppercase;
+          }
+          .duel-user-badge.available { background:rgba(29,185,84,0.18); color:#84ffb4; border:1px solid rgba(29,185,84,0.35); }
+          .duel-user-badge.busy { background:rgba(255,170,0,0.16); color:#ffd590; border:1px solid rgba(255,170,0,0.35); }
+          .duel-user-actions { display:flex; justify-content:flex-end; }
+          .duel-btn {
+            border:none;
+            border-radius:10px;
+            padding:8px 10px;
+            font-family:'Poppins',sans-serif;
+            font-size:12px;
+            font-weight:700;
+            cursor:pointer;
+            background:#1DB954;
+            color:#05210f;
+          }
+          .duel-btn:disabled { opacity:0.45; cursor:not-allowed; }
+          .duel-empty { color:#9f9f9f; font-size:13px; margin:0; }
+          .duel-match-card {
+            background:rgba(255,255,255,0.03);
+            border:1px solid rgba(255,255,255,0.08);
+            border-radius:16px;
+            padding:16px;
+            margin-bottom:16px;
+            display:none;
+          }
+          .duel-match-card.active { display:block; }
+          .duel-scoreboard { display:grid; grid-template-columns:1fr auto 1fr; gap:10px; align-items:center; margin-bottom:12px; }
+          .duel-player { background:rgba(255,255,255,0.03); border-radius:10px; padding:10px; border:1px solid rgba(255,255,255,0.06); }
+          .duel-player-name { font-size:12px; color:#cfcfcf; margin-bottom:4px; }
+          .duel-player-score { font-size:22px; font-weight:800; color:#1DB954; }
+          .duel-vs { font-weight:800; color:#7e7e7e; font-size:16px; }
+          .duel-round-meta { display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:10px; font-size:12px; color:#b3b3b3; }
+          .duel-timer { font-weight:700; color:#1DB954; }
+          .duel-opponent-state { font-size:12px; color:#b3b3b3; min-height:18px; margin-bottom:10px; }
+          .duel-choices { display:grid; grid-template-columns:1fr; gap:8px; }
+          .duel-choice {
+            background:rgba(255,255,255,0.04);
+            border:1px solid rgba(255,255,255,0.08);
+            color:#fff;
+            text-align:left;
+            border-radius:10px;
+            padding:10px;
+            font-family:'Poppins',sans-serif;
+            font-size:13px;
+            font-weight:600;
+            cursor:pointer;
+          }
+          .duel-choice:hover { border-color:#1DB954; background:rgba(29,185,84,0.10); }
+          .duel-choice:disabled { cursor:not-allowed; opacity:0.6; }
+          .duel-choice.correct { border-color:#1DB954; background:rgba(29,185,84,0.18); }
+          .duel-choice.wrong { border-color:#ff5252; background:rgba(255,82,82,0.16); }
+          .duel-overlay {
+            position:fixed;
+            top:76px;
+            right:18px;
+            z-index:1200;
+            display:none;
+            pointer-events:none;
+          }
+          .duel-overlay.active { display:block; }
+          .duel-modal {
+            width:min(390px, calc(100vw - 28px));
+            background:linear-gradient(165deg, rgba(22,22,22,0.97), rgba(10,10,10,0.97));
+            border:1px solid rgba(255,255,255,0.12);
+            border-radius:14px;
+            padding:14px;
+            box-shadow:0 18px 34px rgba(0,0,0,0.45);
+            pointer-events:auto;
+            animation:duel-toast-enter 220ms ease;
+          }
+          .duel-modal h3 { margin:0 0 8px 0; font-size:15px; }
+          .duel-modal p { margin:0 0 10px 0; color:#b3b3b3; font-size:12px; line-height:1.35; }
+          .duel-modal-actions { display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap; }
+          .duel-modal-btn {
+            border:none;
+            border-radius:10px;
+            padding:8px 10px;
+            font-family:'Poppins',sans-serif;
+            font-size:12px;
+            font-weight:700;
+            cursor:pointer;
+          }
+          .duel-modal-btn.accept { background:#1DB954; color:#05210f; }
+          .duel-modal-btn.reject { background:#2a2a2a; color:#fff; }
+          .duel-modal-btn.warn { background:#e57f22; color:#1a1108; }
+          #duel-gameover-overlay .duel-modal {
+            border-color:rgba(29,185,84,0.34);
+            background:
+              radial-gradient(120% 180% at 0% 0%, rgba(29,185,84,0.16), rgba(29,185,84,0) 42%),
+              linear-gradient(165deg, rgba(22,22,22,0.98), rgba(10,10,10,0.98));
+          }
+          #duel-gameover-overlay .duel-modal h3 {
+            font-size:17px;
+            color:#e9fff2;
+          }
+          #duel-gameover-overlay .duel-modal-actions {
+            margin-top:12px;
+          }
+          .duel-result-score {
+            display:block;
+            font-size:28px;
+            line-height:1;
+            margin:4px 0 6px 0;
+            font-weight:800;
+            letter-spacing:0.3px;
+            color:#9ef5be;
+          }
+          .duel-result-sub {
+            display:block;
+            font-size:11px;
+            color:#9f9f9f;
+          }
+          .duel-toast-progress {
+            width:100%;
+            height:6px;
+            border-radius:999px;
+            background:rgba(255,255,255,0.12);
+            overflow:hidden;
+            margin:0 0 10px 0;
+          }
+          .duel-toast-progress-fill {
+            width:100%;
+            height:100%;
+            background:linear-gradient(90deg, #1DB954, #9ef5be);
+            transform-origin:left center;
+            transform:scaleX(1);
+          }
+          .duel-toast-meta { font-size:11px; color:#9f9f9f; margin-bottom:10px; }
+          .duel-toast-actions-hidden { display:none !important; }
+          @keyframes duel-toast-enter {
+            from { opacity:0; transform:translateY(-8px) scale(0.98); }
+            to { opacity:1; transform:translateY(0) scale(1); }
+          }
           .leaderboard-grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; margin:8px 0 26px; }
           .leaderboard-card {
             background:rgba(255,255,255,0.03);
@@ -1513,6 +2598,9 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             .games-tab-bar { width:100% !important; gap:6px !important; padding:4px !important; }
             .games-tab-btn { flex:1 !important; padding:8px 10px !important; font-size:0.72rem !important; }
             .games-stage { max-width:100% !important; }
+            .duel-users-list { grid-template-columns:1fr !important; }
+            .duel-scoreboard { grid-template-columns:1fr !important; }
+            .duel-vs { text-align:center !important; }
             .leaderboard-grid { grid-template-columns:1fr !important; gap:10px !important; margin-bottom:14px !important; }
             .leaderboard-card { padding:10px !important; border-radius:12px !important; }
             .leaderboard-title { font-size:0.84rem !important; margin-bottom:8px !important; }
@@ -1679,6 +2767,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
 
                 <div class="games-tab-bar" role="tablist" aria-label="Minispiele Bereich">
                   <button id="games-tab-games" class="games-tab-btn active" type="button" onclick="switchGamesTab('games')">Spiele</button>
+                  <button id="games-tab-duel" class="games-tab-btn" type="button" onclick="switchGamesTab('duel')">Live-Quizduell</button>
                   <button id="games-tab-leaderboard" class="games-tab-btn" type="button" onclick="switchGamesTab('leaderboard')">Leaderboard</button>
                 </div>
               </div>
@@ -1688,6 +2777,38 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
                   <div id="game-arena">
                     <p class="games-hint">Wähle oben ein Minispiel aus, um zu starten!</p>
                   </div>
+                </div>
+              </div>
+
+              <div id="games-panel-duel" class="games-panel">
+                <div class="duel-lobby-card" id="duel-lobby-card">
+                  <div class="duel-lobby-head">
+                    <h3 class="duel-lobby-title"><i class="fas fa-bolt"></i> Live Quizduell</h3>
+                    <span class="duel-status-chip" id="duel-connection-chip">Verbinde…</span>
+                  </div>
+                  <div id="duel-users-list" class="duel-users-list">
+                    <p class="duel-empty">Warte auf Online-Spieler…</p>
+                  </div>
+                </div>
+
+                <div class="duel-match-card" id="duel-match-card">
+                  <div class="duel-scoreboard">
+                    <div class="duel-player">
+                      <div class="duel-player-name" id="duel-player-a-name">Du</div>
+                      <div class="duel-player-score" id="duel-player-a-score">0</div>
+                    </div>
+                    <div class="duel-vs">VS</div>
+                    <div class="duel-player">
+                      <div class="duel-player-name" id="duel-player-b-name">Gegner</div>
+                      <div class="duel-player-score" id="duel-player-b-score">0</div>
+                    </div>
+                  </div>
+                  <div class="duel-round-meta">
+                    <span id="duel-round-label">Runde 0/5</span>
+                    <span class="duel-timer" id="duel-timer-label">15s</span>
+                  </div>
+                  <div class="duel-opponent-state" id="duel-opponent-state"></div>
+                  <div id="duel-question-anchor"></div>
                 </div>
               </div>
 
@@ -1760,6 +2881,34 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           </button>
         </nav>
 
+        <div class="duel-overlay" id="duel-challenge-overlay">
+          <div class="duel-modal">
+            <h3 id="duel-challenge-title">Challenge erhalten</h3>
+            <div class="duel-toast-progress"><div id="duel-challenge-progress" class="duel-toast-progress-fill"></div></div>
+            <p id="duel-challenge-text">Ein Spieler fordert dich heraus.</p>
+            <div class="duel-toast-meta" id="duel-challenge-meta"></div>
+            <div class="duel-modal-actions" id="duel-incoming-actions">
+              <button class="duel-modal-btn reject" id="duel-reject-btn" type="button">Ablehnen</button>
+              <button class="duel-modal-btn accept" id="duel-accept-btn" type="button">Annehmen</button>
+            </div>
+            <div class="duel-modal-actions duel-toast-actions-hidden" id="duel-outgoing-actions">
+              <button class="duel-modal-btn warn" id="duel-cancel-outgoing-btn" type="button">Anfrage abbrechen</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="duel-overlay" id="duel-gameover-overlay">
+          <div class="duel-modal">
+            <h3 id="duel-gameover-title">Duell beendet</h3>
+            <p id="duel-gameover-text"></p>
+            <div class="duel-modal-actions">
+              <button class="duel-modal-btn reject" id="duel-close-gameover-btn" type="button">Schließen</button>
+              <button class="duel-modal-btn accept" id="duel-rematch-btn" type="button">Revanche</button>
+            </div>
+          </div>
+        </div>
+
+        <script src="/socket.io/socket.io.js"></script>
         <script>
           let isPlayingLive = false, isFetchPending = false;
           let localProgress = 0, localDuration = 0, lastLoadedImage = '';
@@ -1770,6 +2919,666 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           const currentTracksData = JSON.parse(decodeURIComponent(atob("${base64CurrentTracks}")));
           const currentArtistsData = JSON.parse(decodeURIComponent(atob("${base64CurrentArtists}")));
           const highscoreState = { quiz: 0, slider: 0 };
+          let duelSocket = null;
+          let duelSelfUserId = null;
+          let duelLatestPresenceUsers = [];
+          let duelPendingIncoming = null;
+          let duelPendingOutgoing = null;
+          let duelLastOpponent = null;
+          let duelState = {
+            activeMatchId: null,
+            activeRoundIndex: -1,
+            totalRounds: 5,
+            roundDurationMs: 22000,
+            selectedTrackId: null,
+            currentCorrectTrackId: null,
+            players: [],
+            scores: {},
+            roundEndsAt: 0,
+            voteUnlockAt: 0,
+            timerHandle: null,
+            answeredUsers: {}
+          };
+          const DUEL_PREVIEW_SNIPPET_SECONDS = 7;
+          const DUEL_PREVIEW_MAX_START_SECONDS = 12;
+          const DUEL_VOTE_LOCK_MS = 1000;
+          const DUEL_GAME_OVER_AUTO_HIDE_MS = 30000;
+          let duelChallengeTimeoutMs = 30000;
+          let duelPreviewSnippetTimeoutHandle = null;
+          let duelVoteUnlockTimeoutHandle = null;
+          let duelChallengeCountdownHandle = null;
+          let duelGameOverAutoHideHandle = null;
+
+          function setDuelConnectionState(label, isOnline) {
+            const chip = document.getElementById('duel-connection-chip');
+            if (!chip) return;
+            chip.textContent = label;
+            chip.style.borderColor = isOnline ? 'rgba(29,185,84,0.45)' : 'rgba(255,255,255,0.15)';
+            chip.style.color = isOnline ? '#84ffb4' : '#d8d8d8';
+          }
+
+          function getDuelPlayerDisplayName(userId) {
+            const player = (duelState.players || []).find((p) => p.userId === userId);
+            return player ? player.displayName : userId;
+          }
+
+          function renderDuelUsers(users) {
+            const list = document.getElementById('duel-users-list');
+            if (!list) return;
+
+            const normalizedSelfUserId = String(duelSelfUserId || '').trim();
+            if (!normalizedSelfUserId) {
+              list.innerHTML = '<p class="duel-empty">Verbinde dein Profil…</p>';
+              return;
+            }
+
+            const others = (users || []).filter((u) => String(u?.userId || '').trim() !== normalizedSelfUserId);
+            if (others.length === 0) {
+              list.innerHTML = '<p class="duel-empty">Noch keine anderen Spieler online.</p>';
+              return;
+            }
+
+            list.innerHTML = others.map((user) => {
+              const busy = user.status !== 'available';
+              const statusClass = busy ? 'busy' : 'available';
+              const statusLabel = busy ? 'Busy' : 'Online';
+              const disabled = busy || !!duelState.activeMatchId ? 'disabled' : '';
+              const buttonLabel = busy ? 'Nicht verfügbar' : 'Herausfordern';
+              return '' +
+                '<div class="duel-user-item">' +
+                  '<div class="duel-user-head">' +
+                    '<div class="duel-user-name">' + escapeHtml(user.displayName || user.userId) + '</div>' +
+                    '<span class="duel-user-badge ' + statusClass + '">' + statusLabel + '</span>' +
+                  '</div>' +
+                  '<div class="duel-user-actions">' +
+                    '<button class="duel-btn" type="button" data-duel-target="' + escapeHtml(user.userId) + '" ' + disabled + '>' + buttonLabel + '</button>' +
+                  '</div>' +
+                '</div>';
+            }).join('');
+
+            list.querySelectorAll('button[data-duel-target]').forEach((button) => {
+              button.addEventListener('click', () => {
+                if (!duelSocket || !duelSocket.connected) return;
+                const targetUserId = button.getAttribute('data-duel-target');
+                duelLastOpponent = targetUserId;
+                duelSocket.emit('duel:challenge-user', { targetUserId });
+              });
+            });
+          }
+
+          function clearDuelChallengeCountdown() {
+            if (duelChallengeCountdownHandle) {
+              clearInterval(duelChallengeCountdownHandle);
+              duelChallengeCountdownHandle = null;
+            }
+          }
+
+          function clearDuelGameOverAutoHide() {
+            if (duelGameOverAutoHideHandle) {
+              clearTimeout(duelGameOverAutoHideHandle);
+              duelGameOverAutoHideHandle = null;
+            }
+          }
+
+          function renderChallengeToastProgress(expiresAt) {
+            const fill = document.getElementById('duel-challenge-progress');
+            const meta = document.getElementById('duel-challenge-meta');
+            if (!fill || !meta) return;
+
+            const totalMs = Math.max(1, Number(duelChallengeTimeoutMs || 30000));
+            const leftMs = Math.max(0, Number(expiresAt || 0) - Date.now());
+            const ratio = Math.max(0, Math.min(1, leftMs / totalMs));
+            fill.style.transform = 'scaleX(' + ratio.toFixed(4) + ')';
+            meta.textContent = 'Verbleibend: ' + Math.ceil(leftMs / 1000) + 's';
+          }
+
+          function startChallengeToastCountdown(expiresAt) {
+            clearDuelChallengeCountdown();
+            renderChallengeToastProgress(expiresAt);
+            duelChallengeCountdownHandle = setInterval(() => {
+              renderChallengeToastProgress(expiresAt);
+              if (Date.now() >= Number(expiresAt || 0)) {
+                clearDuelChallengeCountdown();
+              }
+            }, 200);
+          }
+
+          function showIncomingChallengeModal(payload) {
+            duelPendingIncoming = payload || null;
+            duelPendingOutgoing = null;
+            const overlay = document.getElementById('duel-challenge-overlay');
+            const title = document.getElementById('duel-challenge-title');
+            const text = document.getElementById('duel-challenge-text');
+            const incomingActions = document.getElementById('duel-incoming-actions');
+            const outgoingActions = document.getElementById('duel-outgoing-actions');
+            if (title) title.textContent = 'Challenge erhalten';
+            if (text) {
+              text.textContent = (payload.fromDisplayName || 'Ein Spieler') + ' fordert dich zu einem Quizduell heraus.';
+            }
+            if (incomingActions) incomingActions.classList.remove('duel-toast-actions-hidden');
+            if (outgoingActions) outgoingActions.classList.add('duel-toast-actions-hidden');
+            startChallengeToastCountdown(payload?.expiresAt || (Date.now() + duelChallengeTimeoutMs));
+            if (overlay) overlay.classList.add('active');
+          }
+
+          function showOutgoingChallengeToast(payload) {
+            duelPendingIncoming = null;
+            duelPendingOutgoing = payload || null;
+            const overlay = document.getElementById('duel-challenge-overlay');
+            const title = document.getElementById('duel-challenge-title');
+            const text = document.getElementById('duel-challenge-text');
+            const incomingActions = document.getElementById('duel-incoming-actions');
+            const outgoingActions = document.getElementById('duel-outgoing-actions');
+            if (title) title.textContent = 'Anfrage gesendet';
+            if (text) {
+              text.textContent = 'Warte auf Antwort von ' + (payload?.toDisplayName || 'dem Spieler') + '.';
+            }
+            if (incomingActions) incomingActions.classList.add('duel-toast-actions-hidden');
+            if (outgoingActions) outgoingActions.classList.remove('duel-toast-actions-hidden');
+            startChallengeToastCountdown(payload?.expiresAt || (Date.now() + duelChallengeTimeoutMs));
+            if (overlay) overlay.classList.add('active');
+          }
+
+          function hideIncomingChallengeModal() {
+            duelPendingIncoming = null;
+            duelPendingOutgoing = null;
+            clearDuelChallengeCountdown();
+            const overlay = document.getElementById('duel-challenge-overlay');
+            if (overlay) overlay.classList.remove('active');
+          }
+
+          function clearDuelTimer() {
+            if (duelState.timerHandle) {
+              clearInterval(duelState.timerHandle);
+              duelState.timerHandle = null;
+            }
+          }
+
+          function clearDuelVoteUnlockTimer() {
+            if (duelVoteUnlockTimeoutHandle) {
+              clearTimeout(duelVoteUnlockTimeoutHandle);
+              duelVoteUnlockTimeoutHandle = null;
+            }
+          }
+
+          function updateDuelTimerLabel() {
+            const timerLabel = document.getElementById('duel-timer-label');
+            if (!timerLabel) return;
+            if (!duelState.roundEndsAt) {
+              timerLabel.textContent = Math.ceil((duelState.roundDurationMs || 22000) / 1000) + 's';
+              return;
+            }
+            const leftMs = Math.max(0, duelState.roundEndsAt - Date.now());
+            timerLabel.textContent = Math.ceil(leftMs / 1000) + 's';
+          }
+
+          function startDuelTimer() {
+            clearDuelTimer();
+            updateDuelTimerLabel();
+            duelState.timerHandle = setInterval(() => {
+              updateDuelTimerLabel();
+              if (Date.now() >= duelState.roundEndsAt) {
+                clearDuelTimer();
+              }
+            }, 200);
+          }
+
+          function renderDuelScoreboard() {
+            const matchCard = document.getElementById('duel-match-card');
+            if (!matchCard) return;
+            const isActive = !!duelState.activeMatchId;
+            matchCard.classList.toggle('active', isActive);
+            if (!isActive) return;
+
+            const me = (duelState.players || []).find((p) => p.userId === duelSelfUserId) || { userId: duelSelfUserId, displayName: 'Du' };
+            const opponent = (duelState.players || []).find((p) => p.userId !== duelSelfUserId) || { userId: 'opponent', displayName: 'Gegner' };
+
+            const aName = document.getElementById('duel-player-a-name');
+            const bName = document.getElementById('duel-player-b-name');
+            const aScore = document.getElementById('duel-player-a-score');
+            const bScore = document.getElementById('duel-player-b-score');
+            const roundLabel = document.getElementById('duel-round-label');
+
+            if (aName) aName.textContent = me.displayName + ' (Du)';
+            if (bName) bName.textContent = opponent.displayName;
+            if (aScore) aScore.textContent = String(duelState.scores[me.userId] || 0);
+            if (bScore) bScore.textContent = String(duelState.scores[opponent.userId] || 0);
+            if (roundLabel) roundLabel.textContent = 'Runde ' + (duelState.activeRoundIndex + 1) + '/' + duelState.totalRounds;
+          }
+
+          function stopDuelPreviewPlayback() {
+            if (duelPreviewSnippetTimeoutHandle) {
+              clearTimeout(duelPreviewSnippetTimeoutHandle);
+              duelPreviewSnippetTimeoutHandle = null;
+            }
+
+            const audio = document.getElementById('duel-preview-audio');
+            if (!audio) return;
+
+            try {
+              audio.pause();
+              audio.currentTime = 0;
+            } catch (err) {
+              // no-op
+            }
+          }
+
+          async function playDuelPreviewSnippet(triggeredByUser) {
+            const audio = document.getElementById('duel-preview-audio');
+            const button = document.getElementById('duel-preview-snippet-btn');
+            const status = document.getElementById('duel-preview-status');
+            if (!audio || !button || !status) return;
+
+            stopDuelPreviewPlayback();
+            button.disabled = true;
+            status.textContent = 'Spiele 7s-Hörprobe...';
+
+            try {
+              if (!Number.isFinite(audio.duration) || audio.duration <= 0) {
+                await new Promise((resolve, reject) => {
+                  const onLoaded = () => {
+                    cleanup();
+                    resolve();
+                  };
+                  const onError = () => {
+                    cleanup();
+                    reject(new Error('preview-metadata-error'));
+                  };
+                  const cleanup = () => {
+                    audio.removeEventListener('loadedmetadata', onLoaded);
+                    audio.removeEventListener('error', onError);
+                  };
+
+                  audio.addEventListener('loadedmetadata', onLoaded, { once: true });
+                  audio.addEventListener('error', onError, { once: true });
+                  audio.load();
+                });
+              }
+
+              const duration = Number(audio.duration) || 0;
+              const latestStart = duration > DUEL_PREVIEW_SNIPPET_SECONDS
+                ? Math.min(duration - DUEL_PREVIEW_SNIPPET_SECONDS, DUEL_PREVIEW_MAX_START_SECONDS)
+                : 0;
+              const startAt = latestStart > 0 ? Math.random() * latestStart : 0;
+
+              audio.currentTime = startAt;
+              await audio.play();
+
+              duelPreviewSnippetTimeoutHandle = setTimeout(() => {
+                duelPreviewSnippetTimeoutHandle = null;
+                try {
+                  audio.pause();
+                } catch (err) {
+                  // no-op
+                }
+                status.textContent = 'Snippet beendet.';
+                button.disabled = false;
+              }, DUEL_PREVIEW_SNIPPET_SECONDS * 1000);
+            } catch (err) {
+              stopDuelPreviewPlayback();
+              status.textContent = triggeredByUser
+                ? 'Preview konnte nicht abgespielt werden.'
+                : 'Autoplay blockiert. Klicke auf "7s-Hörprobe abspielen".';
+              button.disabled = false;
+            }
+          }
+
+          function bindDuelPreviewSnippet() {
+            const audio = document.getElementById('duel-preview-audio');
+            const button = document.getElementById('duel-preview-snippet-btn');
+            const status = document.getElementById('duel-preview-status');
+            if (!audio || !button || !status) return;
+
+            button.addEventListener('click', async () => {
+              await playDuelPreviewSnippet(true);
+            });
+          }
+
+          function renderDuelQuestion(payload) {
+            stopDuelPreviewPlayback();
+            const anchor = document.getElementById('duel-question-anchor');
+            if (!anchor) return;
+
+            const prompt = payload.prompt || {};
+            const options = Array.isArray(payload.options) ? payload.options : [];
+            const image = escapeHtml(prompt.image || 'https://via.placeholder.com/300');
+            const previewUrl = prompt.previewUrl ? escapeHtml(prompt.previewUrl) : '';
+            const hasPreview = !!previewUrl;
+            const snippetStatus = hasPreview ? 'Hörprobe startet automatisch. Du kannst währenddessen antworten.' : 'Für diesen Song gibt es bei Spotify keine Preview.';
+
+            anchor.innerHTML = '' +
+              '<div class="quiz-card" style="max-width:100%; margin:0;">' +
+                '<div class="quiz-img-wrapper"><img class="quiz-img" src="' + image + '" alt="Song Cover"></div>' +
+                '<h3 style="margin-bottom:8px;">Welcher Song gehört zu diesem Cover?</h3>' +
+                '<div style="margin:8px 0 14px;">' +
+                      '<button id="duel-preview-snippet-btn" class="duel-btn" type="button" ' + (hasPreview ? '' : 'disabled') + '>7s-Hörprobe abspielen</button>' +
+                      '<span id="duel-preview-status" style="display:block; margin-top:8px; color:#9b9b9b; font-size:12px;">' + snippetStatus + '</span>' +
+                      '<audio id="duel-preview-audio" preload="metadata" style="display:none;">' +
+                        '<source src="' + previewUrl + '" type="audio/mpeg">' +
+                      '</audio>' +
+                    '</div>' +
+                '<div class="duel-choices" id="duel-choices"></div>' +
+              '</div>';
+
+            if (previewUrl) {
+              bindDuelPreviewSnippet();
+            }
+
+            const choices = document.getElementById('duel-choices');
+            if (!choices) return;
+            choices.innerHTML = options.map((opt) => {
+              return '<button class="duel-choice" type="button" data-track-id="' + escapeHtml(opt.trackId) + '">' + escapeHtml(opt.title) + '</button>';
+            }).join('');
+
+            const nowMs = Date.now();
+            const voteLocked = nowMs < duelState.voteUnlockAt;
+            choices.querySelectorAll('.duel-choice').forEach((btn) => {
+              btn.disabled = voteLocked;
+            });
+            if (voteLocked) {
+              clearDuelVoteUnlockTimer();
+              duelVoteUnlockTimeoutHandle = setTimeout(() => {
+                duelVoteUnlockTimeoutHandle = null;
+                if (duelState.selectedTrackId) return;
+                document.querySelectorAll('#duel-choices .duel-choice').forEach((btn) => {
+                  btn.disabled = false;
+                });
+              }, Math.max(0, duelState.voteUnlockAt - nowMs));
+            }
+
+            choices.querySelectorAll('.duel-choice').forEach((btn) => {
+              btn.addEventListener('click', () => {
+                if (!duelSocket || !duelState.activeMatchId || duelState.selectedTrackId) return;
+                const selectedTrackId = btn.getAttribute('data-track-id');
+                duelState.selectedTrackId = selectedTrackId;
+                stopDuelPreviewPlayback();
+                duelSocket.emit('duel:answer', {
+                  matchId: duelState.activeMatchId,
+                  roundIndex: duelState.activeRoundIndex,
+                  selectedTrackId
+                });
+                choices.querySelectorAll('.duel-choice').forEach((other) => {
+                  other.disabled = true;
+                  if (other === btn) {
+                    other.style.borderColor = '#1DB954';
+                  }
+                });
+              });
+            });
+
+            if (hasPreview) {
+              playDuelPreviewSnippet(false).catch(() => {
+                // no-op: fallback text is shown in status line
+              });
+            }
+          }
+
+          function updateOpponentAnsweredState() {
+            const el = document.getElementById('duel-opponent-state');
+            if (!el) return;
+            const opponent = (duelState.players || []).find((p) => p.userId !== duelSelfUserId);
+            if (!opponent) {
+              el.textContent = '';
+              return;
+            }
+            const opponentAnswered = !!duelState.answeredUsers[opponent.userId];
+            el.textContent = opponentAnswered ? opponent.displayName + ' hat geantwortet.' : opponent.displayName + ' wählt noch...';
+          }
+
+          function applyRoundResult(payload) {
+            const correctTrackId = payload.correctTrackId;
+            const choices = document.querySelectorAll('#duel-choices .duel-choice');
+            choices.forEach((btn) => {
+              const trackId = btn.getAttribute('data-track-id');
+              btn.disabled = true;
+              if (trackId === correctTrackId) {
+                btn.classList.add('correct');
+              } else if (duelState.selectedTrackId && trackId === duelState.selectedTrackId) {
+                btn.classList.add('wrong');
+              }
+            });
+
+            duelState.scores = payload.scores || duelState.scores;
+            renderDuelScoreboard();
+          }
+
+          function closeGameOverOverlay() {
+            clearDuelGameOverAutoHide();
+            const overlay = document.getElementById('duel-gameover-overlay');
+            if (overlay) overlay.classList.remove('active');
+          }
+
+          function showGameOverOverlay(payload) {
+            const overlay = document.getElementById('duel-gameover-overlay');
+            const title = document.getElementById('duel-gameover-title');
+            const text = document.getElementById('duel-gameover-text');
+            if (!overlay || !title || !text) return;
+
+            const winner = payload.winnerUserId ? getDuelPlayerDisplayName(payload.winnerUserId) : null;
+            const myScore = Number((payload.scores || {})[duelSelfUserId] || 0);
+            const opponent = (payload.players || []).find((p) => p.userId !== duelSelfUserId);
+            const opponentName = escapeHtml(opponent?.displayName || 'Gegner');
+            const oppScore = Number((payload.scores || {})[opponent?.userId] || 0);
+
+            if (!winner) {
+              title.textContent = 'Unentschieden';
+            } else if (payload.winnerUserId === duelSelfUserId) {
+              title.textContent = 'Du hast gewonnen!';
+            } else {
+              title.textContent = winner + ' gewinnt';
+            }
+
+            text.innerHTML =
+              '<span style="display:block; color:#b3b3b3;">Endstand</span>' +
+              '<span class="duel-result-score">' + myScore + ' : ' + oppScore + '</span>' +
+              '<span class="duel-result-sub">Du vs ' + opponentName + '</span>';
+            overlay.classList.add('active');
+            clearDuelGameOverAutoHide();
+            duelGameOverAutoHideHandle = setTimeout(() => {
+              closeGameOverOverlay();
+            }, DUEL_GAME_OVER_AUTO_HIDE_MS);
+          }
+
+          function resetDuelState() {
+            clearDuelTimer();
+            clearDuelVoteUnlockTimer();
+            stopDuelPreviewPlayback();
+            duelState.activeMatchId = null;
+            duelState.activeRoundIndex = -1;
+            duelState.roundDurationMs = 22000;
+            duelState.selectedTrackId = null;
+            duelState.currentCorrectTrackId = null;
+            duelState.players = [];
+            duelState.scores = {};
+            duelState.roundEndsAt = 0;
+            duelState.voteUnlockAt = 0;
+            duelState.answeredUsers = {};
+            const anchor = document.getElementById('duel-question-anchor');
+            if (anchor) anchor.innerHTML = '';
+            const stateEl = document.getElementById('duel-opponent-state');
+            if (stateEl) stateEl.textContent = '';
+            renderDuelScoreboard();
+          }
+
+          function bindDuelModalButtons() {
+            const acceptBtn = document.getElementById('duel-accept-btn');
+            const rejectBtn = document.getElementById('duel-reject-btn');
+            const closeGameOverBtn = document.getElementById('duel-close-gameover-btn');
+            const rematchBtn = document.getElementById('duel-rematch-btn');
+            const cancelOutgoingBtn = document.getElementById('duel-cancel-outgoing-btn');
+
+            if (acceptBtn) {
+              acceptBtn.addEventListener('click', () => {
+                if (!duelSocket || !duelPendingIncoming) return;
+                duelSocket.emit('duel:challenge-accept', { challengeId: duelPendingIncoming.challengeId });
+                hideIncomingChallengeModal();
+              });
+            }
+
+            if (rejectBtn) {
+              rejectBtn.addEventListener('click', () => {
+                if (!duelSocket || !duelPendingIncoming) return;
+                duelSocket.emit('duel:challenge-reject', { challengeId: duelPendingIncoming.challengeId });
+                hideIncomingChallengeModal();
+              });
+            }
+
+            if (closeGameOverBtn) {
+              closeGameOverBtn.addEventListener('click', () => {
+                closeGameOverOverlay();
+              });
+            }
+
+            if (rematchBtn) {
+              rematchBtn.addEventListener('click', () => {
+                closeGameOverOverlay();
+                if (!duelSocket || !duelSocket.connected || !duelLastOpponent) return;
+                duelSocket.emit('duel:challenge-user', { targetUserId: duelLastOpponent });
+              });
+            }
+
+            if (cancelOutgoingBtn) {
+              cancelOutgoingBtn.addEventListener('click', () => {
+                if (!duelSocket || !duelPendingOutgoing?.challengeId) return;
+                duelSocket.emit('duel:challenge-cancel', { challengeId: duelPendingOutgoing.challengeId });
+                setDuelConnectionState('Anfrage wird abgebrochen...', true);
+              });
+            }
+          }
+
+          function setupDuelSocket() {
+            if (typeof io !== 'function') {
+              console.error('Socket.io Client ist nicht geladen.');
+              return;
+            }
+
+            duelSocket = io({ withCredentials: true, transports: ['websocket', 'polling'] });
+
+            duelSocket.on('connect', () => {
+              setDuelConnectionState('Online', true);
+            });
+
+            duelSocket.on('disconnect', () => {
+              setDuelConnectionState('Offline', false);
+              hideIncomingChallengeModal();
+              resetDuelState();
+            });
+
+            duelSocket.on('duel:hello', (payload) => {
+              duelSelfUserId = payload.userId;
+              duelState.totalRounds = Number(payload.rounds || 5);
+              duelState.roundDurationMs = Number(payload.roundDurationMs || duelState.roundDurationMs || 22000);
+              duelChallengeTimeoutMs = Number(payload.challengeTimeoutMs || duelChallengeTimeoutMs || 30000);
+              renderDuelUsers(duelLatestPresenceUsers);
+            });
+
+            duelSocket.on('duel:presence', (payload) => {
+              duelLatestPresenceUsers = Array.isArray(payload.users) ? payload.users : [];
+              renderDuelUsers(duelLatestPresenceUsers);
+            });
+
+            duelSocket.on('duel:incoming-challenge', (payload) => {
+              showIncomingChallengeModal(payload);
+            });
+
+            duelSocket.on('duel:challenge-sent', (payload) => {
+              setDuelConnectionState('Challenge gesendet', true);
+              duelLastOpponent = payload.toUserId;
+              showOutgoingChallengeToast(payload);
+            });
+
+            duelSocket.on('duel:challenge-rejected', () => {
+              setDuelConnectionState('Challenge abgelehnt', true);
+              hideIncomingChallengeModal();
+            });
+
+            duelSocket.on('duel:challenge-expired', (payload) => {
+              const reason = String(payload?.reason || 'expired');
+              const message = reason === 'disconnect'
+                ? 'Challenge beendet (Offline)'
+                : (reason === 'unavailable' ? 'Challenge nicht mehr verfügbar' : 'Challenge abgelaufen');
+              setDuelConnectionState(message, true);
+              hideIncomingChallengeModal();
+            });
+
+            duelSocket.on('duel:challenge-cancelled', () => {
+              setDuelConnectionState('Challenge abgebrochen', true);
+              hideIncomingChallengeModal();
+            });
+
+            duelSocket.on('duel:user-busy', () => {
+              setDuelConnectionState('Spieler ist beschäftigt', true);
+            });
+
+            duelSocket.on('duel:challenge-accepted', (payload) => {
+              duelLastOpponent = (payload.players || []).find((p) => p.userId !== duelSelfUserId)?.userId || duelLastOpponent;
+              setDuelConnectionState('Match startet...', true);
+              hideIncomingChallengeModal();
+              switchGamesTab('duel');
+              switchPage('page-games');
+            });
+
+            duelSocket.on('duel:match-start', (payload) => {
+              duelState.activeMatchId = payload.matchId;
+              duelState.players = Array.isArray(payload.players) ? payload.players : [];
+              duelState.totalRounds = Number(payload.totalRounds || 5);
+              duelState.roundDurationMs = Number(payload.roundDurationMs || duelState.roundDurationMs || 22000);
+              duelState.scores = {};
+              duelState.players.forEach((p) => { duelState.scores[p.userId] = 0; });
+              duelState.activeRoundIndex = -1;
+              duelState.selectedTrackId = null;
+              duelState.voteUnlockAt = 0;
+              duelState.answeredUsers = {};
+              renderDuelScoreboard();
+              setDuelConnectionState('Im Match', true);
+              switchGamesTab('duel');
+            });
+
+            duelSocket.on('duel:question', (payload) => {
+              duelState.activeMatchId = payload.matchId;
+              duelState.activeRoundIndex = Number(payload.roundIndex || 0);
+              duelState.roundDurationMs = Number(payload.roundDurationMs || duelState.roundDurationMs || 22000);
+              duelState.roundEndsAt = Number(payload.endsAt || 0);
+              duelState.selectedTrackId = null;
+              duelState.currentCorrectTrackId = null;
+              duelState.voteUnlockAt = Date.now() + DUEL_VOTE_LOCK_MS;
+              duelState.answeredUsers = {};
+              renderDuelScoreboard();
+              renderDuelQuestion(payload);
+              updateOpponentAnsweredState();
+              startDuelTimer();
+            });
+
+            duelSocket.on('duel:player-answered', (payload) => {
+              if (!payload || payload.matchId !== duelState.activeMatchId) return;
+              duelState.answeredUsers[payload.userId] = true;
+              updateOpponentAnsweredState();
+            });
+
+            duelSocket.on('duel:round-result', (payload) => {
+              if (!payload || payload.matchId !== duelState.activeMatchId) return;
+              clearDuelTimer();
+              duelState.currentCorrectTrackId = payload.correctTrackId;
+              applyRoundResult(payload);
+            });
+
+            duelSocket.on('duel:game-over', (payload) => {
+              if (!payload) return;
+              if (Array.isArray(payload.players)) {
+                const opponent = payload.players.find((p) => p.userId !== duelSelfUserId);
+                if (opponent) duelLastOpponent = opponent.userId;
+              }
+              showGameOverOverlay(payload);
+              resetDuelState();
+              setDuelConnectionState('Online', true);
+            });
+
+            duelSocket.on('duel:error', (payload) => {
+              const message = payload && payload.message ? payload.message : 'Unbekannter Fehler im Duell.';
+              setDuelConnectionState(message, false);
+              console.error('Duel-Error:', message);
+            });
+          }
 
           function findFirstNumber(value) {
             if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, Math.floor(value));
@@ -1960,16 +3769,24 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           let activeGamesTab = 'games';
 
           function switchGamesTab(tabName) {
-            activeGamesTab = tabName === 'leaderboard' ? 'leaderboard' : 'games';
+            if (tabName === 'leaderboard' || tabName === 'duel' || tabName === 'games') {
+              activeGamesTab = tabName;
+            } else {
+              activeGamesTab = 'games';
+            }
 
             const gamesPanel = document.getElementById('games-panel-games');
+            const duelPanel = document.getElementById('games-panel-duel');
             const leaderboardPanel = document.getElementById('games-panel-leaderboard');
             if (gamesPanel) gamesPanel.classList.toggle('active', activeGamesTab === 'games');
+            if (duelPanel) duelPanel.classList.toggle('active', activeGamesTab === 'duel');
             if (leaderboardPanel) leaderboardPanel.classList.toggle('active', activeGamesTab === 'leaderboard');
 
             const gamesTabBtn = document.getElementById('games-tab-games');
+            const duelTabBtn = document.getElementById('games-tab-duel');
             const leaderboardTabBtn = document.getElementById('games-tab-leaderboard');
             if (gamesTabBtn) gamesTabBtn.classList.toggle('active', activeGamesTab === 'games');
+            if (duelTabBtn) duelTabBtn.classList.toggle('active', activeGamesTab === 'duel');
             if (leaderboardTabBtn) leaderboardTabBtn.classList.toggle('active', activeGamesTab === 'leaderboard');
           }
 
@@ -2688,6 +4505,8 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
               });
             }
             handleMonthChange('current');
+            bindDuelModalButtons();
+            setupDuelSocket();
             updateStatus();
             setInterval(updateStatus, 5000);
           });
@@ -2784,4 +4603,4 @@ app.post('/api/import/spotify', checkAndRefreshUserToken, upload.single('file'),
   });
 });
 
-app.listen(port, () => logWithTimezones('System', `Server läuft auf http://127.0.0.1:${port}`));
+httpServer.listen(port, () => logWithTimezones('System', `Server läuft auf http://127.0.0.1:${port}`));
