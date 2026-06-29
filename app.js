@@ -99,10 +99,20 @@ async function resolveSpotifyUserId(req, userApi) {
   const api = userApi || getUserSpotifyApi(req);
   const me = await api.getMe();
   const userId = me?.body?.id || null;
+  const spotifyDisplayName = String(me?.body?.display_name || me?.body?.id || '').trim();
   if (userId && req.session) {
     req.session.spotifyUserId = userId;
+    if (spotifyDisplayName) {
+      req.session.spotifyDisplayName = spotifyDisplayName;
+    }
   }
   return userId;
+}
+
+function sanitizeLeaderboardDisplayName(name) {
+  const normalized = String(name || '').trim();
+  if (!normalized) return 'Spotify User';
+  return normalized.slice(0, 64);
 }
 
 async function readUserHighscoreDoc(userId) {
@@ -121,6 +131,7 @@ async function upsertUserHighscoreDoc(userId, currentDoc, nextValues) {
   const doc = {
     id: userId,
     userId,
+    displayName: sanitizeLeaderboardDisplayName(nextValues.displayName ?? currentDoc?.displayName),
     quizHighscore: Number(nextValues.quizHighscore ?? currentDoc?.quizHighscore ?? 0) || 0,
     sliderHighscore: Number(nextValues.sliderHighscore ?? currentDoc?.sliderHighscore ?? 0) || 0,
     updatedAt: new Date().toISOString()
@@ -457,6 +468,7 @@ app.get('/', (req, res) => {
         const userId = me?.body?.id;
         if (userId) {
           req.session.spotifyUserId = userId;
+          req.session.spotifyDisplayName = String(me?.body?.display_name || me?.body?.id || '').trim();
           tokenRegistry.set(userId, {
             accessToken: req.session.accessToken,
             refreshToken: req.session.refreshToken,
@@ -759,6 +771,7 @@ app.post('/api/highscores', checkAndRefreshUserToken, Express.json(), async (req
 
     const currentDoc = await readUserHighscoreDoc(userId);
     const nextDoc = {
+      displayName: sanitizeLeaderboardDisplayName(req.session.spotifyDisplayName),
       quizHighscore: Math.max(Number(currentDoc?.quizHighscore) || 0, game === 'quiz' ? scoreInt : 0),
       sliderHighscore: Math.max(Number(currentDoc?.sliderHighscore) || 0, game === 'slider' ? scoreInt : 0)
     };
@@ -777,6 +790,65 @@ app.post('/api/highscores', checkAndRefreshUserToken, Express.json(), async (req
       quizHighscore: Number(req.session.highscores.quiz) || 0,
       sliderHighscore: Number(req.session.highscores.slider) || 0
     });
+  }
+});
+
+app.get('/api/highscores/global', checkAndRefreshUserToken, async (req, res) => {
+  if (!usersContainer) {
+    return res.json({ quizTop20: [], sliderTop20: [] });
+  }
+
+  try {
+    if (!req.session.spotifyDisplayName) {
+      try {
+        const me = await getUserSpotifyApi(req).getMe();
+        req.session.spotifyDisplayName = String(me?.body?.display_name || me?.body?.id || '').trim();
+      } catch (displayNameErr) {
+        logWithTimezones('API', 'DisplayName konnte für /api/highscores/global nicht geladen werden', 'error', displayNameErr);
+      }
+    }
+
+    const currentDisplayName = sanitizeLeaderboardDisplayName(req.session.spotifyDisplayName);
+    const currentNameLower = currentDisplayName.toLowerCase();
+
+    const quizQuery = {
+      query: 'SELECT TOP 20 c.displayName, c.quizHighscore FROM c WHERE IS_DEFINED(c.quizHighscore) ORDER BY c.quizHighscore DESC'
+    };
+    const sliderQuery = {
+      query: 'SELECT TOP 20 c.displayName, c.sliderHighscore FROM c WHERE IS_DEFINED(c.sliderHighscore) ORDER BY c.sliderHighscore DESC'
+    };
+
+    const [quizRowsResult, sliderRowsResult] = await Promise.all([
+      usersContainer.items.query(quizQuery).fetchAll(),
+      usersContainer.items.query(sliderQuery).fetchAll()
+    ]);
+
+    const quizTop20 = (quizRowsResult?.resources || []).map((row, index) => {
+      const displayName = sanitizeLeaderboardDisplayName(row.displayName);
+      const score = Math.max(0, Math.floor(Number(row.quizHighscore) || 0));
+      return {
+        rank: index + 1,
+        displayName,
+        score,
+        isCurrentUser: displayName.toLowerCase() === currentNameLower
+      };
+    });
+
+    const sliderTop20 = (sliderRowsResult?.resources || []).map((row, index) => {
+      const displayName = sanitizeLeaderboardDisplayName(row.displayName);
+      const score = Math.max(0, Math.floor(Number(row.sliderHighscore) || 0));
+      return {
+        rank: index + 1,
+        displayName,
+        score,
+        isCurrentUser: displayName.toLowerCase() === currentNameLower
+      };
+    });
+
+    return res.json({ quizTop20, sliderTop20 });
+  } catch (err) {
+    logWithTimezones('API', '/api/highscores/global Fehler', 'error', err);
+    return res.status(500).json({ error: 'Globale Rangliste konnte nicht geladen werden.' });
   }
 });
 
@@ -963,6 +1035,76 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           }
           .month-selector:focus { border-color:#1DB954; box-shadow:0 0 0 2px rgba(29,185,84,0.2); }
           .month-status { color:#b3b3b3; font-size:12px; margin-bottom:12px; min-height:18px; }
+          .toplist-title-row { margin-top:30px; margin-bottom:12px; }
+          .toplist-title-row .section-title { margin:0; }
+          .toplist-control-row { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; margin-bottom:12px; }
+          .toplist-filter-anchor { flex:1 1 auto; min-width:0; }
+          .toplist-filter-anchor #global-filter-bar {
+            width:auto !important;
+            max-width:none !important;
+            margin:0 !important;
+          }
+          #home-filter-anchor #global-filter-bar {
+            width:100% !important;
+            max-width:1000px !important;
+            margin-bottom:35px !important;
+          }
+          .games-shell { width:100%; max-width:none; margin:0; }
+          .games-title-row { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; flex-wrap:wrap; margin-top:30px; margin-bottom:18px; }
+          .games-title-row .section-title { margin:0; }
+          .games-control-row { display:flex; align-items:center; justify-content:space-between; gap:18px; flex-wrap:wrap; margin-bottom:18px; }
+          .games-action-grid { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:flex-start; }
+          .games-action-card {
+            background:rgba(255,255,255,0.03);
+            border:1px solid rgba(255,255,255,0.05);
+            color:#fff;
+            border-radius:999px;
+            padding:10px 18px;
+            display:inline-flex;
+            align-items:center;
+            gap:9px;
+            font-family:'Poppins',sans-serif;
+            font-size:13px;
+            font-weight:700;
+            cursor:pointer;
+            transition:all 0.2s ease;
+            white-space:nowrap;
+            box-shadow:none;
+          }
+          .games-action-card:hover { background:rgba(255,255,255,0.08); border-color:rgba(255,255,255,0.12); transform:translateY(-1px); }
+          .games-action-card i { color:#1DB954; font-size:15px; }
+          .games-tab-bar { display:flex; gap:10px; padding:6px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); border-radius:999px; width:fit-content; flex-wrap:wrap; }
+          .games-tab-btn { border:none; background:transparent; color:#b3b3b3; padding:9px 18px; border-radius:999px; font-family:'Poppins',sans-serif; font-size:13px; font-weight:700; cursor:pointer; transition:all 0.2s ease; }
+          .games-tab-btn:hover { color:#fff; }
+          .games-tab-btn.active { background:#1DB954; color:#000; }
+          .games-panel { display:none; }
+          .games-panel.active { display:block; }
+          .games-stage { max-width:720px; margin:0 auto; }
+          #game-arena { display:flex; justify-content:center; }
+          .games-hint { text-align:center; color:#b3b3b3; margin:0; }
+          .leaderboard-grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; margin:8px 0 26px; }
+          .leaderboard-card {
+            background:rgba(255,255,255,0.03);
+            border:1px solid rgba(255,255,255,0.08);
+            border-radius:16px;
+            padding:16px;
+            box-shadow:0 14px 30px rgba(0,0,0,0.28);
+          }
+          .leaderboard-title { margin:0 0 12px 0; font-size:16px; font-weight:700; display:flex; align-items:center; gap:8px; }
+          .leaderboard-table { width:100%; border-collapse:collapse; table-layout:fixed; }
+          .leaderboard-table th,
+          .leaderboard-table td { padding:9px 8px; text-align:left; font-size:13px; border-bottom:1px solid rgba(255,255,255,0.06); }
+          .leaderboard-table th { color:#b3b3b3; font-size:11px; text-transform:uppercase; letter-spacing:0.7px; }
+          .leaderboard-table tbody tr:nth-child(even) { background:rgba(255,255,255,0.02); }
+          .leaderboard-rank { width:66px; color:#d4d4d4; font-weight:700; }
+          .leaderboard-score { width:80px; text-align:right !important; font-weight:700; color:#1DB954; }
+          .leaderboard-name { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+          .leaderboard-row--me {
+            outline:1px solid rgba(29,185,84,0.85);
+            box-shadow:inset 0 0 0 1px rgba(29,185,84,0.45);
+            background:rgba(29,185,84,0.12) !important;
+          }
+          .leaderboard-empty td { color:#8f8f8f; font-style:italic; }
           .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:25px; margin-bottom:40px; }
           .card { background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.04); padding:18px; border-radius:16px; transition:all 0.3s cubic-bezier(0.4,0,0.2,1); text-align:center; position:relative; }
           .card:hover { background:rgba(255,255,255,0.06); border-color:rgba(255,255,255,0.1); transform:translateY(-5px); }
@@ -1221,10 +1363,21 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             .main-content { margin-left:0 !important; padding:0.6rem 0.5rem 5.3rem !important; width:100% !important; }
             .section-title { margin-top:0.7rem !important; margin-bottom:0.45rem !important; font-size:1rem !important; }
             .section-header { margin-top:0.5rem !important; margin-bottom:0.4rem !important; gap:0.4rem !important; }
+            .toplist-title-row { margin-top:0.5rem !important; margin-bottom:0.35rem !important; }
+            .toplist-control-row { flex-direction:column !important; align-items:stretch !important; gap:0.4rem !important; margin-bottom:0.4rem !important; }
+            .toplist-filter-anchor { width:100% !important; }
+            .toplist-filter-anchor #global-filter-bar { width:100% !important; max-width:100% !important; margin:0 0 0.35rem 0 !important; }
             .month-selector-wrap { width:100% !important; justify-content:flex-start !important; }
             .month-selector-label { font-size:0.72rem !important; }
             .month-selector { width:100% !important; border-radius:0.5rem !important; padding:0.38rem 0.48rem !important; font-size:0.74rem !important; }
             .month-status { font-size:0.72rem !important; margin-bottom:0.4rem !important; }
+            .leaderboard-grid { grid-template-columns:1fr !important; gap:10px !important; margin-bottom:14px !important; }
+            .leaderboard-card { padding:10px !important; border-radius:12px !important; }
+            .leaderboard-title { font-size:0.84rem !important; margin-bottom:8px !important; }
+            .leaderboard-table th, .leaderboard-table td { padding:7px 6px !important; font-size:0.74rem !important; }
+            .leaderboard-table th { font-size:0.64rem !important; }
+            .leaderboard-rank { width:52px !important; }
+            .leaderboard-score { width:66px !important; }
             .filter-bar { flex-direction:column !important; gap:0.35rem !important; align-items:stretch !important; width:100% !important; margin-bottom:0.5rem !important; max-width:30rem !important; margin-left:auto !important; margin-right:auto !important; }
             .tab-container { width:100% !important; display:flex !important; justify-content:space-between !important; padding:0.15rem !important; gap:0.2rem !important; }
             .tab-btn { flex:1 !important; text-align:center !important; padding:0.35rem 0.15rem !important; font-size:0.7rem !important; }
@@ -1245,6 +1398,22 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             .recent-item img { width:2.2rem !important; height:2.2rem !important; border-radius:0.35rem !important; }
             .recent-title { font-size:0.8rem !important; font-weight:600 !important; margin-bottom:0.05rem !important; }
             .recent-artist { font-size:0.72rem !important; color:#b3b3b3 !important; }
+            .games-shell { max-width:100% !important; }
+            .games-title-row { align-items:flex-start !important; flex-direction:column !important; gap:0.35rem !important; margin-bottom:0.6rem !important; }
+            .games-control-row { flex-direction:column !important; align-items:stretch !important; gap:0.45rem !important; margin-bottom:0.65rem !important; }
+            .games-action-grid { width:100% !important; flex-direction:column !important; gap:8px !important; }
+            .games-action-card { width:100% !important; justify-content:center !important; padding:0.45rem 0.7rem !important; font-size:0.74rem !important; }
+            .games-action-card i { font-size:0.9rem !important; }
+            .games-tab-bar { width:100% !important; gap:6px !important; padding:4px !important; }
+            .games-tab-btn { flex:1 !important; padding:8px 10px !important; font-size:0.72rem !important; }
+            .games-stage { max-width:100% !important; }
+            .leaderboard-grid { grid-template-columns:1fr !important; gap:10px !important; margin-bottom:14px !important; }
+            .leaderboard-card { padding:10px !important; border-radius:12px !important; }
+            .leaderboard-title { font-size:0.84rem !important; margin-bottom:8px !important; }
+            .leaderboard-table th, .leaderboard-table td { padding:7px 6px !important; font-size:0.74rem !important; }
+            .leaderboard-table th { font-size:0.64rem !important; }
+            .leaderboard-rank { width:52px !important; }
+            .leaderboard-score { width:66px !important; }
             /* Vertikale Listenzeilen */
             .grid { display:flex !important; flex-direction:column !important; gap:0.35rem !important; margin-bottom:0.65rem !important; }
             .card { width:100% !important; max-width:32rem !important; margin:0 auto !important; display:flex !important; flex-direction:row !important; align-items:center !important; padding:0.35rem 0.45rem !important; border-radius:0.6rem !important; gap:0.45rem !important; background:rgba(255,255,255,0.05) !important; text-align:left !important; border:1px solid rgba(255,255,255,0.05) !important; }
@@ -1255,7 +1424,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             .card-sub { width:100% !important; max-width:100% !important; font-size:0.8rem !important; line-height:1.2 !important; color:#9f9f9f !important; white-space:nowrap !important; overflow:hidden !important; text-overflow:ellipsis !important; }
             /* Quiz komprimiert */
             .hl-btn { padding:8px 12px !important; font-size:0.85rem !important; margin:4px !important; }
-            #page-games > div:first-of-type { gap:8px !important; margin-bottom:12px !important; }
+            .games-action-grid { margin-bottom:12px !important; }
             .quiz-img { max-width:160px !important; max-height:160px !important; width:100% !important; height:auto !important; }
             .quiz-img-wrapper { margin-bottom:12px !important; }
             .quiz-card h2 { font-size:1rem !important; margin-bottom:6px !important; margin-top:0 !important; }
@@ -1316,6 +1485,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           </div>
           
           <div id="page-home" class="app-page">
+            <div id="home-filter-anchor"></div>
             <div id="live-container"><div class="live-card">Synchronisiere Live-Player...</div></div>
             <h2 class="section-title"><i class="fas fa-history"></i> Kürzlich gehört</h2>
             <div class="recent-list">
@@ -1334,8 +1504,11 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           </div>
 
           <div id="page-tracks" class="app-page">
-            <div class="section-header">
+            <div class="toplist-title-row">
               <h2 class="section-title"><i class="fas fa-music"></i> Deine Top Tracks</h2>
+            </div>
+            <div class="toplist-control-row">
+              <div id="tracks-filter-anchor" class="toplist-filter-anchor"></div>
               <div class="month-selector-wrap">
                 <label class="month-selector-label" for="month-selector">Monat:</label>
                 <select id="month-selector" class="month-selector">
@@ -1356,8 +1529,11 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           </div>
 
           <div id="page-artists" class="app-page">
-            <div class="section-header">
+            <div class="toplist-title-row">
               <h2 class="section-title"><i class="fas fa-microphone"></i> Deine Lieblingskünstler</h2>
+            </div>
+            <div class="toplist-control-row">
+              <div id="artists-filter-anchor" class="toplist-filter-anchor"></div>
               <div class="month-selector-wrap">
                 <label class="month-selector-label" for="month-selector-artists">Monat:</label>
                 <select id="month-selector-artists" class="month-selector">
@@ -1378,13 +1554,71 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           </div>
 
           <div id="page-games" class="app-page">
-            <h2 class="section-title"><i class="fas fa-gamepad"></i> Musik-Minispiele</h2>
-            <div style="display:flex; justify-content:center; gap:20px; margin-bottom:30px;">
-              <button class="hl-btn" onclick="startSongQuiz()">Song-Erkennungs-Quiz</button>
-              <button class="hl-btn" onclick="startYearQuiz()">Release-Jahr-Quiz</button>
-            </div>
-            <div id="game-arena">
-              <p style="text-align:center; color:#b3b3b3;">Wähle oben ein Minispiel aus, um zu starten!</p>
+            <div class="games-shell">
+              <div class="games-title-row">
+                <h2 class="section-title"><i class="fas fa-gamepad"></i> Musik-Minispiele</h2>
+              </div>
+
+              <div class="games-control-row">
+                <div class="games-action-grid" aria-label="Minispiel auswählen">
+                  <button class="games-action-card" type="button" onclick="startSongQuiz()">
+                    <i class="fas fa-music"></i>
+                    <span>Song-Erkennungs-Quiz</span>
+                  </button>
+                  <button class="games-action-card" type="button" onclick="startYearQuiz()">
+                    <i class="fas fa-clock"></i>
+                    <span>Release-Jahr-Quiz</span>
+                  </button>
+                </div>
+
+                <div class="games-tab-bar" role="tablist" aria-label="Minispiele Bereich">
+                  <button id="games-tab-games" class="games-tab-btn active" type="button" onclick="switchGamesTab('games')">Spiele</button>
+                  <button id="games-tab-leaderboard" class="games-tab-btn" type="button" onclick="switchGamesTab('leaderboard')">Leaderboard</button>
+                </div>
+              </div>
+
+              <div id="games-panel-games" class="games-panel active">
+                <div class="games-stage">
+                  <div id="game-arena">
+                    <p class="games-hint">Wähle oben ein Minispiel aus, um zu starten!</p>
+                  </div>
+                </div>
+              </div>
+
+              <div id="games-panel-leaderboard" class="games-panel">
+                <div class="leaderboard-grid">
+                  <div class="leaderboard-card">
+                    <h3 class="leaderboard-title"><i class="fas fa-trophy"></i> Globales Quiz Ranking</h3>
+                    <table class="leaderboard-table" aria-label="Globales Quiz Ranking">
+                      <thead>
+                        <tr>
+                          <th class="leaderboard-rank">Platz</th>
+                          <th>Name</th>
+                          <th class="leaderboard-score">Score</th>
+                        </tr>
+                      </thead>
+                      <tbody id="quiz-leaderboard-body">
+                        <tr class="leaderboard-empty"><td colspan="3">Lade Rangliste…</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <div class="leaderboard-card">
+                    <h3 class="leaderboard-title"><i class="fas fa-sliders"></i> Globales Slider Ranking</h3>
+                    <table class="leaderboard-table" aria-label="Globales Slider Ranking">
+                      <thead>
+                        <tr>
+                          <th class="leaderboard-rank">Platz</th>
+                          <th>Name</th>
+                          <th class="leaderboard-score">Score</th>
+                        </tr>
+                      </thead>
+                      <tbody id="slider-leaderboard-body">
+                        <tr class="leaderboard-empty"><td colspan="3">Lade Rangliste…</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -1579,6 +1813,60 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             });
           }
 
+          function renderLeaderboardTable(tableBodyId, entries) {
+            const tbody = document.getElementById(tableBodyId);
+            if (!tbody) return;
+
+            if (!Array.isArray(entries) || entries.length === 0) {
+              tbody.innerHTML = '<tr class="leaderboard-empty"><td colspan="3">Noch keine Scores vorhanden.</td></tr>';
+              return;
+            }
+
+            tbody.innerHTML = entries.map((entry, idx) => {
+              const rank = Math.max(1, parseInt(entry.rank, 10) || (idx + 1));
+              const displayName = escapeHtml(entry.displayName || 'Spotify User');
+              const score = Math.max(0, parseInt(entry.score, 10) || 0);
+              const rowClass = entry.isCurrentUser ? 'leaderboard-row--me' : '';
+              return '<tr class="' + rowClass + '">' +
+                '<td class="leaderboard-rank">#' + rank + '</td>' +
+                '<td class="leaderboard-name">' + displayName + '</td>' +
+                '<td class="leaderboard-score">' + score + '</td>' +
+              '</tr>';
+            }).join('');
+          }
+
+          async function loadGlobalLeaderboard() {
+            try {
+              const res = await fetch('/api/highscores/global');
+              if (!res || !res.ok) {
+                throw new Error('Leaderboard konnte nicht geladen werden.');
+              }
+              const data = await res.json();
+              renderLeaderboardTable('quiz-leaderboard-body', Array.isArray(data.quizTop20) ? data.quizTop20 : []);
+              renderLeaderboardTable('slider-leaderboard-body', Array.isArray(data.sliderTop20) ? data.sliderTop20 : []);
+            } catch (err) {
+              console.error('Fehler beim Laden des globalen Leaderboards:', err);
+              renderLeaderboardTable('quiz-leaderboard-body', []);
+              renderLeaderboardTable('slider-leaderboard-body', []);
+            }
+          }
+
+          let activeGamesTab = 'games';
+
+          function switchGamesTab(tabName) {
+            activeGamesTab = tabName === 'leaderboard' ? 'leaderboard' : 'games';
+
+            const gamesPanel = document.getElementById('games-panel-games');
+            const leaderboardPanel = document.getElementById('games-panel-leaderboard');
+            if (gamesPanel) gamesPanel.classList.toggle('active', activeGamesTab === 'games');
+            if (leaderboardPanel) leaderboardPanel.classList.toggle('active', activeGamesTab === 'leaderboard');
+
+            const gamesTabBtn = document.getElementById('games-tab-games');
+            const leaderboardTabBtn = document.getElementById('games-tab-leaderboard');
+            if (gamesTabBtn) gamesTabBtn.classList.toggle('active', activeGamesTab === 'games');
+            if (leaderboardTabBtn) leaderboardTabBtn.classList.toggle('active', activeGamesTab === 'leaderboard');
+          }
+
           function setMonthStatus(message, isError) {
             const tracksStatus = document.getElementById('month-status-tracks');
             const artistsStatus = document.getElementById('month-status-artists');
@@ -1719,8 +2007,15 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             const filterBar = document.getElementById('global-filter-bar');
             const dropLimit = document.getElementById('dropdown-limit');
             const dropRecent = document.getElementById('dropdown-recent');
+            const homeFilterAnchor = document.getElementById('home-filter-anchor');
+            const tracksFilterAnchor = document.getElementById('tracks-filter-anchor');
+            const artistsFilterAnchor = document.getElementById('artists-filter-anchor');
 
             if (pageId === 'page-tracks' || pageId === 'page-artists') {
+              if (filterBar) {
+                const nextAnchor = pageId === 'page-tracks' ? tracksFilterAnchor : artistsFilterAnchor;
+                if (nextAnchor) nextAnchor.appendChild(filterBar);
+              }
               // Nur bei den Top-Listen zeigen wir die Leiste und das Eintrags-Limit
               if (filterBar) filterBar.style.setProperty('display', 'flex', 'important');
               if (dropLimit) dropLimit.style.setProperty('display', 'flex', 'important');
@@ -1728,6 +2023,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
               // Aktiven Monat nach dem Seitenwechsel neu anwenden (historischer Modus bleibt erhalten)
               setTimeout(function() { handleMonthChange(activeMonthValue); }, 0);
             } else if (pageId === 'page-home') {
+              if (filterBar && homeFilterAnchor) homeFilterAnchor.appendChild(filterBar);
               // Auf Home blenden wir die Zeit-Pillen aus, zeigen aber das Verlaufs-Limit rechts!
               if (filterBar) filterBar.style.setProperty('display', 'flex', 'important');
               // Trick: Wir verstecken die Buttons (tab-container) im CSS, lassen das Dropdown aber da
@@ -1885,6 +2181,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           let yearHighScore = 0;
 
           function startSongQuiz() {
+            switchGamesTab('games');
             if (typeof quizPool !== 'undefined' && quizPool.length < 4) {
               document.getElementById('game-arena').innerHTML = '<p style="text-align:center;color:#ff5252;">Nicht genug Songs für ein Quiz vorhanden.</p>';
               return;
@@ -2101,6 +2398,7 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
           let yearSliderMax = new Date().getFullYear();
 
           function startYearQuiz() {
+            switchGamesTab('games');
             if (typeof yearPool === 'undefined' || yearPool.length < 1) {
               document.getElementById('game-arena').innerHTML = '<p style="text-align:center;color:#ff5252;">Nicht genug Songs mit Erscheinungsjahr vorhanden.</p>';
               return;
@@ -2267,6 +2565,9 @@ app.get('/stats', checkAndRefreshUserToken, async (req, res) => {
             setTimeout(() => switchPage(initialPage), 50);
             loadDashboardData().catch((err) => {
               console.error('Dashboard-Daten konnten nicht geladen werden:', err);
+            });
+            loadGlobalLeaderboard().catch((err) => {
+              console.error('Leaderboard konnte nicht geladen werden:', err);
             });
             const monthSelector = document.getElementById('month-selector');
             const monthSelectorArtists = document.getElementById('month-selector-artists');
